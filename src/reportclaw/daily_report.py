@@ -178,11 +178,11 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
         name="StockHeader",
         parent=styles["Heading2"],
         fontName=base_font,
-        fontSize=10.5,
-        leading=13,
+        fontSize=12.5,
+        leading=18,
         spaceBefore=4,
         spaceAfter=6,
-        alignment=2,
+        alignment=0,
     )
     section_header = ParagraphStyle(
         name="SectionHeader",
