@@ -1,0 +1,14 @@
+certifi==2026.2.25
+cffi==2.0.0
+charset-normalizer==3.4.4
+cryptography==46.0.5
+idna==3.11
+mysql-connector-python==9.6.0
+pdfminer.six==20251230
+pdfplumber==0.11.9
+pillow==12.1.1
+pycparser==3.0
+pypdfium2==5.5.0
+reportlab==4.4.10
+requests==2.32.5
+urllib3==2.6.3

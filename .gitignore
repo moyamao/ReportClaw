@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# venv
+venv/
+.venv/
+
+# runtime data
+data/
+logs/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+#conf
+conf/config.ini
