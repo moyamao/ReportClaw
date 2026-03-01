@@ -1,3 +1,41 @@
+"""
+ReportClaw - cninfo 年报抓取 + 第三节（管理层讨论与分析）解析入库脚本
+
+作用
+- 从 cninfo（巨潮资讯）按“全市场（深交所 + 上交所）”拉取最近 N 天披露的“年度报告全文”公告（排除摘要/短PDF）。
+- 下载 PDF 到本地 data/downloads/（若已存在则不重复下载）。
+- 解析 PDF 的“第三节 管理层讨论与分析”正文：
+    - 提取“管理层综述”（第三节开头到“核心竞争力分析/主营业务分析/公司治理/重要事项/未来展望/风险提示/经营情况讨论与分析”等大章之前）
+    - 可选提取“未来展望”（如“十一、公司未来发展的展望”）
+- 将结果写入 MySQL：
+    - annual_reports：股票代码/名称/报告年度/披露日期/pdf路径
+    - annual_report_mda：management_overview（存入 main_business_section）、future_section、full_mda
+
+配置
+- conf/config.ini 必须包含：
+    [mysql]
+    host=...
+    port=3306
+    user=...
+    pass=...
+    db=stock
+
+- 可选：
+    [crawler]
+    days_back = 30   # 默认 30，表示仅拉取最近 N 天披露的年报公告
+
+运行
+- 建议使用项目 venv：
+    ./venv/bin/python src/reportclaw/main.py
+
+输出目录
+- PDF 下载目录：data/downloads/
+-（日报 PDF 生成与发送由 daily_report.py 负责，输出到 data/report/）
+
+注意
+- 本脚本使用 (stock_code, report_year) 做“去重”，已入库的同公司同年份不会重复插入。
+- 若需要支持“更正/修订版覆盖更新”，应改为按 announcementId/adjunctUrl 做版本化或 update 逻辑。
+"""
 import os
 import re
 import time
@@ -23,7 +61,20 @@ STATE_DIR = DATA_DIR / "state"
 # ===============================
 # 数据库客户端
 # ===============================
+
 class MySQLClient:
+    """
+    MySQL 访问封装（最小职责）
+    - 读取 conf/config.ini 的 [mysql] 段建立连接
+    - 提供年报入库所需的基础操作：
+        * exists(stock_code, year): 判断同公司同年份是否已入库
+        * insert_report(...): 写 annual_reports，返回 report_id
+        * insert_mda(report_id, mda): 写 annual_report_mda
+
+    约定
+    - annual_reports 以 (stock_code, report_year) 作为逻辑唯一键（代码层面去重）。
+      如需更强一致性，建议在 DB 上加唯一索引 uq_stock_year(stock_code, report_year)。
+    """
 
     def __init__(self):
         config = configparser.ConfigParser()
@@ -531,6 +582,14 @@ class AnnualReportParser:
 # 主逻辑
 # ===============================
 def main():
+    """
+    主流程（Orchestration）
+    1) 读取 crawler 配置（days_back）
+    2) 分别拉取深交所(szse)与上交所(sse)公告分页（只保留“年度报告全文”，排除摘要）
+    3) 严格按时间窗口过滤（避免 seDate 失效导致拉到历史公告）
+    4) 下载 PDF（若已存在则跳过下载），并做页数阈值过滤（<50 页视为非完整年报）
+    5) 解析第三节管理层讨论与分析，入库 annual_reports + annual_report_mda
+    """
     download_dir = str(DOWNLOADS_DIR)
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 

@@ -1,3 +1,45 @@
+"""
+ReportClaw - 每日年报摘录汇总（PDF 生成 + 邮件发送）
+
+作用
+- 从 MySQL（annual_reports + annual_report_mda）读取“新增入库”的年报摘录（以 annual_report_mda.created_at 为准）。
+- 将每个标的的摘要按固定版式渲染为一个汇总 PDF（默认输出到 data/report/）。
+- 可选通过 SMTP 发送邮件（支持多收件人）。
+
+增量逻辑（不漏发）
+- 以 annual_report_mda.created_at 做增量边界：
+    m.created_at ∈ (last_sent_at, now]
+- 状态文件：data/state/last_sent.json，记录 last_sent_at（精确到秒）。
+- 这样即使你昨天上午发过一次，昨天下午/晚上新入库的年报也会在今天再次发送，不会漏。
+
+配置（conf/config.ini）
+- [mysql] 必填：host/port/user/pass/db
+- [email] 可选：
+    enabled=true/false
+    host, port, use_ssl, timeout
+    user, pass, from, to
+  说明：to 支持多个收件人，逗号/分号/空格分隔。
+
+用法
+1) 默认增量（推荐）：按 created_at 从 last_sent_at 到 now 生成 PDF 并按配置发送
+    python src/reportclaw/daily_report.py
+
+2) 只生成不发邮件：
+    python src/reportclaw/daily_report.py --no-email
+
+3) 仅发送邮件（假设 PDF 已生成）：
+    python src/reportclaw/daily_report.py --only-email
+
+4) 手工指定某个披露日（publish_date）生成（不影响 last_sent_at）：
+    python src/reportclaw/daily_report.py --date YYYY-MM-DD
+
+5) 忽略 last_sent_at，仅取今天 00:00 到现在的入库记录：
+    python src/reportclaw/daily_report.py --today-only
+
+输出
+- PDF：data/report/annual_report_summary_YYYY-MM-DD.pdf
+- 状态：data/state/last_sent.json
+"""
 import argparse
 import configparser
 import datetime as dt
@@ -162,6 +204,22 @@ def _ensure_chinese_font(styles):
 
 
 def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
+    """
+    将 rows（DB 查询结果）渲染为汇总 PDF。
+
+    rows: list[dict]，字段包含：
+      - stock_code/stock_name/report_year/publish_date/file_path
+      - main_business_section（管理层综述摘录）
+      - future_section（未来展望摘录，可为空）
+      - created_at（用于展示与增量范围说明）
+
+    版式策略（面向可读性）
+    - 清理页眉页脚/页码
+    - 合并短行（表格抽取污染）
+    - 软断行超长 token（避免右侧溢出）
+    - 重新排版为自然段 + 小标题分隔
+    - 段首缩进（HTML 全角空格实体）
+    """
     styles = getSampleStyleSheet()
     base_font = _ensure_chinese_font(styles)
 
@@ -453,6 +511,14 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
 
 
 def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str, subject: str, body: str, attachment_path: str):
+    """
+    通过 SMTP 发送带 PDF 附件的邮件。
+
+    注意
+    - cfg 来自 conf/config.ini 的 [email] 段
+    - to_addr 可为逗号分隔的多个收件人
+    - use_ssl=true 使用 SMTP_SSL；否则使用 STARTTLS
+    """
     if "email" not in cfg:
         raise RuntimeError("config.ini missing [email] section")
 
@@ -524,6 +590,12 @@ def load_config(path: str) -> configparser.ConfigParser:
     return cfg
 
 def main():
+    """
+    CLI 入口：
+    - 手工模式（--date）：按 publish_date 生成，不更新 last_sent_at
+    - 增量模式（默认）：按 created_at 生成，成功后更新 last_sent_at
+    - 支持 --no-email / --only-email / --today-only
+    """
     args = parse_args()
     cfg = load_config(args.config)
 
