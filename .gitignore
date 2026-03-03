@@ -21,3 +21,4 @@ logs/
 
 #conf
 conf/config.ini
+/conf/alert-smoke-411802-24e5da358203.json

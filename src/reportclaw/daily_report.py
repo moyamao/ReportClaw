@@ -61,6 +61,8 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 from pathlib import Path
 
+from reportclaw.sheet_sync import sync_rows_to_google_sheet
+
  # daily_report.py 位于 src/reportclaw/ 下，所以项目根目录是再向上两级
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONF_DIR = PROJECT_ROOT / "conf"
@@ -622,6 +624,11 @@ def main():
 
             generate_daily_summary_pdf(rows, out_pdf, range_label)
             print(f"已生成每日汇总PDF: {out_pdf}")
+            # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
+            try:
+                sync_rows_to_google_sheet(cfg, rows)
+            except Exception as e:
+                print(f"[sheets] 同步失败（忽略，不影响主流程）：{e}")
         else:
             if not Path(out_pdf).exists():
                 print(f"未找到PDF文件: {out_pdf}，无法仅发送邮件")
@@ -661,6 +668,11 @@ def main():
 
             generate_daily_summary_pdf(rows, out_pdf, range_label)
             print(f"已生成每日汇总PDF: {out_pdf}")
+            # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
+            try:
+                sync_rows_to_google_sheet(cfg, rows)
+            except Exception as e:
+                print(f"[sheets] 同步失败（忽略，不影响主流程）：{e}")
         else:
             if not Path(out_pdf).exists():
                 print(f"未找到PDF文件: {out_pdf}，无法仅发送邮件")
