@@ -27,6 +27,16 @@ week_start = mon                   # mon / sun （仅 weekly 模式：周起始�
 month_source = publish_date         # publish_date / created_at
 tab_without_year = false          # true 时：monthly 用 MM，weekly 用 Wxx（去掉 YYYY- 前缀）
 
+[sheets_daily]
+# 可选：每日快照（第二个 Google Sheet，每天一个 tab，tab 名：M.D，例如 3.6）
+enabled = false
+spreadsheet_id =
+credentials_json = conf/google_service_account.json   # 可复用同一个 service account
+worksheet_prefix =                                   # 留空即可；tab 直接用日期（M.D）
+key_mode = stock_year_date
+# tab_auto_sort = true
+# tab_sort_desc = true
+
 说明
 - 需要在 Google Sheet 里把该 Sheet 分享给 Service Account 邮箱（Editor 权限）。
 - credentials_json 必须加入 .gitignore，不要提交到 GitHub。
@@ -134,6 +144,7 @@ def sync_rows_to_google_sheet(
     rows: List[Dict[str, Any]],
     *,
     project_root: Optional[Path] = None,
+    run_date: Optional[dt.date] = None,
 ) -> None:
     """
     将 rows 同步到 Google Sheets（幂等 upsert）。
@@ -145,6 +156,7 @@ def sync_rows_to_google_sheet(
     """
     if not rows:
         return
+    run_date = run_date or dt.date.today()
 
     if not cfg.has_section("sheets"):
         print("[sheets] 未配置 [sheets] 段，跳过同步")
@@ -258,6 +270,119 @@ def sync_rows_to_google_sheet(
         )
         print("[sheets] 同步完成")
 
+    # Optional: daily snapshot spreadsheet (each day one tab named M.D, e.g. 3.6)
+    _maybe_sync_daily_snapshot(
+        cfg,
+        rows,
+        sheets_http=http,
+        run_date=run_date,
+        project_root=root,
+    )
+
+
+# --- Optional daily snapshot sync ---
+def _maybe_sync_daily_snapshot(
+    cfg: configparser.ConfigParser,
+    rows: List[Dict[str, Any]],
+    *,
+    sheets_http,
+    run_date: dt.date,
+    project_root: Path,
+) -> None:
+    """
+    Optional second spreadsheet sync:
+    - A separate Google Sheet configured in [sheets_daily]
+    - One worksheet(tab) per run date, named M.D (e.g. 3.6)
+    - Uses the same row schema as the primary sheet (DEFAULT_HEADER)
+    """
+    if not cfg.has_section("sheets_daily"):
+        return
+
+    enabled = _cfg_bool(cfg, "sheets_daily", "enabled", default=False)
+    if not enabled:
+        return
+
+    spreadsheet_id = cfg.get("sheets_daily", "spreadsheet_id", fallback="").strip()
+    if not spreadsheet_id:
+        print("[sheets_daily] spreadsheet_id 为空，跳过每日快照同步")
+        return
+
+    # Allow reuse of the same credentials_json, defaulting to [sheets].credentials_json
+    cred_path = cfg.get("sheets_daily", "credentials_json", fallback="").strip()
+    if not cred_path:
+        cred_path = cfg.get("sheets", "credentials_json", fallback="").strip()
+
+    if not cred_path:
+        print("[sheets_daily] credentials_json 为空，跳过每日快照同步")
+        return
+
+    cred_file = Path(cred_path)
+    if not cred_file.is_absolute():
+        cred_file = (project_root / cred_file).resolve()
+    if not cred_file.exists():
+        print(f"[sheets_daily] credentials_json 不存在: {cred_file}，跳过每日快照同步")
+        return
+
+    key_mode = cfg.get("sheets_daily", "key_mode", fallback="stock_year_date").strip() or "stock_year_date"
+    tab_auto_sort = _cfg_bool(cfg, "sheets_daily", "tab_auto_sort", default=True)
+    tab_sort_desc = _cfg_bool(cfg, "sheets_daily", "tab_sort_desc", default=True)
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = service_account.Credentials.from_service_account_file(str(cred_file), scopes=scopes)
+
+    http = AuthorizedHttp(creds, http=sheets_http)
+    sheets = build("sheets", "v4", http=http, cache_discovery=False)
+
+    def _to_date(v: Any) -> Optional[dt.date]:
+        if isinstance(v, dt.datetime):
+            return v.date()
+        if isinstance(v, dt.date):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if len(s) >= 10:
+                # Accept: YYYY-MM-DD..., YYYY/MM/DD..., YYYY.MM.DD...
+                head = s[:10].replace("/", "-").replace(".", "-")
+                try:
+                    return dt.date.fromisoformat(head)
+                except Exception:
+                    pass
+            # Accept compact: YYYYMMDD
+            if len(s) >= 8 and s[:8].isdigit():
+                try:
+                    y = int(s[0:4]); m = int(s[4:6]); d = int(s[6:8])
+                    return dt.date(y, m, d)
+                except Exception:
+                    pass
+            return None
+
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        d = _to_date(r.get("publish_date")) or run_date
+        tab = f"{d.month}.{d.day}"
+        buckets.setdefault(tab, []).append(r)
+
+    if len(buckets) > 1:
+        summary = ", ".join([f"{k}:{len(v)}" for k, v in sorted(buckets.items())])
+        print(f"[sheets_daily] bucket tabs={len(buckets)} ({summary})")
+    else:
+        only = next(iter(buckets.keys())) if buckets else ""
+        print(f"[sheets_daily] bucket tabs=1 ({only})")
+
+    for tab, rs in buckets.items():
+        _sync_rows_to_worksheet(
+            sheets,
+            spreadsheet_id,
+            tab,
+            rs,
+            header=DEFAULT_HEADER,
+            key_mode=key_mode,
+        )
+        print(f"[sheets_daily] {tab}: 同步完成（rows={len(rs)}）")
+
+    if tab_auto_sort:
+        _auto_sort_tabs_daily(sheets, spreadsheet_id, desc=tab_sort_desc)
+
 
 def _sync_rows_to_worksheet(
     sheets,
@@ -318,6 +443,79 @@ def _sync_rows_to_worksheet(
 # -------------------------
 # Helpers
 # -------------------------
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def _auto_sort_tabs_daily(
+    sheets,
+    spreadsheet_id: str,
+    *,
+    desc: bool = True,
+) -> None:
+    """
+    Auto-sort daily snapshot tabs whose titles are like 'M.D' (e.g. 3.6, 2.28).
+    Tabs not matching this pattern are kept after the dated tabs in their original order.
+    """
+    try:
+        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_entries = meta.get("sheets", []) or []
+        if not sheet_entries:
+            return
+
+        tabs: List[Dict[str, Any]] = []
+        for s in sheet_entries:
+            p = s.get("properties", {}) or {}
+            tabs.append(
+                {
+                    "title": str(p.get("title", "")),
+                    "sheetId": int(p.get("sheetId")),
+                    "index": int(p.get("index", 0)),
+                }
+            )
+
+        def _key(t: str) -> Optional[Tuple[int, int]]:
+            m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", t.strip())
+            if not m:
+                return None
+            mm = int(m.group(1))
+            dd = int(m.group(2))
+            if not (1 <= mm <= 12 and 1 <= dd <= 31):
+                return None
+            return (mm, dd)
+
+        targets: List[Tuple[Tuple[int, int], Dict[str, Any]]] = []
+        for t in tabs:
+            k = _key(t["title"])
+            if k is not None:
+                targets.append((k, t))
+
+        if not targets:
+            return
+
+        targets.sort(key=lambda x: x[0], reverse=desc)
+
+        target_ids = {t["sheetId"] for _, t in targets}
+        rest = [t for t in sorted(tabs, key=lambda x: x["index"]) if t["sheetId"] not in target_ids]
+
+        new_order = [t for _, t in targets] + rest
+
+        reqs = []
+        for new_idx, t in enumerate(new_order):
+            reqs.append(
+                {
+                    "updateSheetProperties": {
+                        "properties": {"sheetId": t["sheetId"], "index": new_idx},
+                        "fields": "index",
+                    }
+                }
+            )
+
+        sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": reqs}).execute()
+        print(f"[sheets_daily] 已自动重排 tab（desc={desc}）")
+    except Exception as e:
+        print(f"[sheets_daily] 自动重排 tab 失败（忽略）：{e}")
 
 def _auto_sort_tabs(
     sheets,

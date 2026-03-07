@@ -7,10 +7,11 @@ ReportClaw - 每日年报摘录汇总（PDF 生成 + 邮件发送）
 - 可选通过 SMTP 发送邮件（支持多收件人）。
 
 增量逻辑（不漏发）
-- 以 annual_report_mda.created_at 做增量边界：
-    m.created_at ∈ (last_sent_at, now]
-- 状态文件：data/state/last_sent.json，记录 last_sent_at（精确到秒）。
-- 这样即使你昨天上午发过一次，昨天下午/晚上新入库的年报也会在今天再次发送，不会漏。
+- 以 annual_report_mda.created_at 做增量边界（防重复）：
+    m.created_at ∈ (last_generated_iso, now]
+- 状态文件：data/state/last_sent.json
+    - last_generated_iso：上次成功生成日报 PDF 的截止时间（用于防止第二天重复出现在报表里）
+    - last_sent_iso：上次成功发邮件的截止时间（仅用于邮件侧的审计/可选重发）
 
 配置（conf/config.ini）
 - [mysql] 必填：host/port/user/pass/db
@@ -21,7 +22,7 @@ ReportClaw - 每日年报摘录汇总（PDF 生成 + 邮件发送）
   说明：to 支持多个收件人，逗号/分号/空格分隔。
 
 用法
-1) 默认增量（推荐）：按 created_at 从 last_sent_at 到 now 生成 PDF 并按配置发送
+1) 默认增量（推荐）：按 created_at 从 last_sent_iso 到 now 生成 PDF 并按配置发送
     python src/reportclaw/daily_report.py
 
 2) 只生成不发邮件：
@@ -33,8 +34,15 @@ ReportClaw - 每日年报摘录汇总（PDF 生成 + 邮件发送）
 4) 手工指定某个披露日（publish_date）生成（不影响 last_sent_at）：
     python src/reportclaw/daily_report.py --date YYYY-MM-DD
 
-5) 忽略 last_sent_at，仅取今天 00:00 到现在的入库记录：
+5) 忽略 last_sent_iso，仅取今天 00:00 到现在的入库记录：
     python src/reportclaw/daily_report.py --today-only
+
+6) 使用代理方式修改google sheet
+export HTTPS_PROXY=http://127.0.0.1:1092
+export HTTP_PROXY=http://127.0.0.1:1092
+export https_proxy=http://127.0.0.1:1092
+export http_proxy=http://127.0.0.1:1092
+PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report --no-email --date 2026-02-28
 
 输出
 - PDF：data/report/annual_report_summary_YYYY-MM-DD.pdf
@@ -81,27 +89,128 @@ def _state_path() -> Path:
     return STATE_DIR / "last_sent.json"
 
 
+
 def load_last_sent_at() -> dt.datetime | None:
+    """Load last sent timestamp from shared state file.
+
+    Shared schema (one file):
+      - last_sent_iso: used by daily_report (preferred)
+      - last_crawl_end_iso: used by main crawler (must be preserved)
+
+    Backward compatible:
+      - legacy key: last_sent_at (format: YYYY-MM-DD HH:MM:SS)
+    """
     sp = _state_path()
     if not sp.exists():
         return None
     try:
         data = json.loads(sp.read_text(encoding="utf-8"))
-        v = data.get("last_sent_at")
+        if not isinstance(data, dict):
+            return None
+
+        v = data.get("last_sent_iso") or data.get("last_sent_at")
         if not v:
             return None
-        return _parse_dt(v)
+
+        # accept unix ts
+        if isinstance(v, (int, float)):
+            return dt.datetime.fromtimestamp(float(v))
+
+        s = str(v).strip()
+        if not s:
+            return None
+
+        # legacy: "YYYY-MM-DD HH:MM:SS"
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", s):
+            return _parse_dt(s)
+
+        # date-only
+        if len(s) == 10:
+            return dt.datetime.strptime(s, "%Y-%m-%d")
+
+        # iso datetime
+        return dt.datetime.fromisoformat(s)
     except Exception:
         return None
 
 
 def save_last_sent_at(ts: dt.datetime):
+    """Save last sent timestamp into shared state file without overwriting other keys."""
     sp = _state_path()
     sp.parent.mkdir(parents=True, exist_ok=True)
-    sp.write_text(
-        json.dumps({"last_sent_at": ts.strftime("%Y-%m-%d %H:%M:%S")}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+
+    obj = {}
+    if sp.exists():
+        try:
+            old = json.loads(sp.read_text(encoding="utf-8"))
+            if isinstance(old, dict):
+                obj.update(old)
+        except Exception:
+            obj = {}
+
+    # preferred key (ISO, seconds)
+    obj["last_sent_iso"] = ts.replace(microsecond=0).isoformat()
+
+    # 不再写入重复的 legacy 字段 last_sent_at（避免状态文件冗余）。
+    # 读取端仍兼容 last_sent_at，方便你历史文件平滑过渡。
+    if "last_sent_at" in obj:
+        obj.pop("last_sent_at", None)
+
+    sp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# --- Helpers for last generated timestamp (防止重复出现在报表) ---
+def load_last_generated_at() -> dt.datetime | None:
+    """Load last generated timestamp from shared state file.
+
+    Preferred key: last_generated_iso (ISO)
+    Backward compatible: if missing, fall back to last_sent_iso / last_sent_at.
+    """
+    sp = _state_path()
+    if not sp.exists():
+        return None
+    try:
+        data = json.loads(sp.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+
+        v = data.get("last_generated_iso") or data.get("last_sent_iso") or data.get("last_sent_at")
+        if not v:
+            return None
+
+        if isinstance(v, (int, float)):
+            return dt.datetime.fromtimestamp(float(v))
+
+        s = str(v).strip()
+        if not s:
+            return None
+
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", s):
+            return _parse_dt(s)
+        if len(s) == 10:
+            return dt.datetime.strptime(s, "%Y-%m-%d")
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def save_last_generated_at(ts: dt.datetime):
+    """Save last generated timestamp (ISO) into shared state file without overwriting other keys."""
+    sp = _state_path()
+    sp.parent.mkdir(parents=True, exist_ok=True)
+
+    obj = {}
+    if sp.exists():
+        try:
+            old = json.loads(sp.read_text(encoding="utf-8"))
+            if isinstance(old, dict):
+                obj.update(old)
+        except Exception:
+            obj = {}
+
+    obj["last_generated_iso"] = ts.replace(microsecond=0).isoformat()
+
+    sp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def mysql_connect(cfg: configparser.ConfigParser):
@@ -122,7 +231,7 @@ def fetch_rows_by_publish_date(conn, publish_date: str):
         """
         SELECT
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          m.industry_section, m.main_business_section, m.future_section
+          m.industry_section, m.main_business_section, m.future_section, m.full_mda
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE r.publish_date = %s
@@ -144,7 +253,7 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
         """
         SELECT
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          m.industry_section, m.main_business_section, m.future_section
+          m.industry_section, m.main_business_section, m.future_section, m.full_mda
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE r.publish_date >= %s AND r.publish_date <= %s
@@ -165,12 +274,12 @@ def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
         """
         SELECT
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          m.industry_section, m.main_business_section, m.future_section,
+          m.industry_section, m.main_business_section, m.future_section, m.full_mda,
           m.created_at
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE m.created_at > %s AND m.created_at <= %s
-        ORDER BY m.created_at, r.stock_code
+        ORDER BY m.created_at ASC, r.stock_code ASC
         """,
         (start_ts, end_ts),
     )
@@ -291,6 +400,26 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
     story = []
     story.append(Paragraph(f"年报摘录汇总（{title_date}）", h1))
     story.append(Spacer(1, 6 * mm))
+    def pick_section_text(primary: str | None, fallback_full: str, max_chars: int = 12000) -> str | None:
+        """Prefer primary section text; otherwise fall back to full_mda.
+
+        For parse-failed placeholders, we strip the sentinel first line and then cap length.
+        """
+        if primary and str(primary).strip():
+            return str(primary)
+        if not fallback_full:
+            return None
+        t = str(fallback_full)
+        if t.startswith("[PARSE_FAILED]"):
+            # drop sentinel line
+            parts = t.split("\n", 1)
+            t = parts[1] if len(parts) == 2 else ""
+        t = t.strip()
+        if not t:
+            return None
+        if len(t) > max_chars:
+            t = t[:max_chars] + "\n...（内容过长已截断）"
+        return t
 
     def safe_block(text: str):
         if not text:
@@ -372,15 +501,45 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
             for s in tmp:
                 # “短行”判定：长度很短且不以句号/分号等结束（更像表格单元格）
                 is_short = (len(s) <= 6) and (not re.search(r"[。；;：:]$", s))
+
                 if is_short:
                     buf.append(s)
                     # 防止无限累积：到一定数量就先输出
                     if len(buf) >= 12:
                         flush_buf()
                     continue
-                else:
-                    flush_buf()
-                    merged.append(s)
+
+                # 非短行：这里要特别处理“单独的序号行”——例如 PDF 抽取把
+                # "2、新能源电池" 拆成两行："2" + "新能源电池"。
+                # 若直接 flush_buf()，会把 "2" 合并到上一段末尾，导致序号跑到前面。
+                if len(buf) == 1:
+                    token = buf[0].strip()
+
+                    # 纯阿拉伯数字序号：2 / 10
+                    if re.fullmatch(r"\d{1,2}", token):
+                        # 若下一行本身已经以序号开头，就不要重复加
+                        if not re.match(r"^\d{1,2}\s*[、\.．:：)]", s):
+                            merged.append(f"{token}、{s}")
+                            buf = []
+                            continue
+
+                    # 中文数字序号：二 / 十二
+                    if re.fullmatch(r"[一二三四五六七八九十]{1,3}", token):
+                        if not re.match(r"^[一二三四五六七八九十]{1,3}\s*[、\.．:：)]", s):
+                            merged.append(f"{token}、{s}")
+                            buf = []
+                            continue
+
+                    # 括号序号：(2) / （2） / (二) / （二）
+                    if re.fullmatch(r"[（(]\s*(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*[）)]", token):
+                        # 这类通常是小节标题前缀，直接拼到下一行
+                        merged.append(f"{token}{s}")
+                        buf = []
+                        continue
+
+                # 其他情况：按原逻辑处理
+                flush_buf()
+                merged.append(s)
 
             flush_buf()
 
@@ -478,6 +637,10 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
         except Exception:
             pdf_name = ""
 
+        # Fallback full_mda and parse-failed marker
+        full_mda = r.get("full_mda") or ""
+        is_parse_failed = full_mda.startswith("[PARSE_FAILED]")
+
         # header 尽量控制在一行：不展示入库时间；文件名过长则截断
         if pdf_name and len(pdf_name) > 42:
             pdf_name = pdf_name[:39] + "..."
@@ -488,18 +651,20 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
         )
         if pdf_name:
             header += f" | 文件 {pdf_name}"
+        if is_parse_failed:
+            header += " | PARSE_FAILED"
 
         story.append(Paragraph(header, stock_header))
         story.append(HRFlowable(width="100%", thickness=0.8, spaceBefore=2, spaceAfter=6))
 
         story.append(Paragraph("管理层综述（摘录）", section_header))
-        story.append(safe_block(r.get("main_business_section")))
+        story.append(safe_block(pick_section_text(r.get("main_business_section"), full_mda)))
         story.append(Spacer(1, 2 * mm))
         story.append(Preformatted("-" * 60, pre))
         story.append(Spacer(1, 2 * mm))
 
         story.append(Paragraph("未来展望（摘录）", section_header))
-        story.append(safe_block(r.get("future_section")))
+        story.append(safe_block(pick_section_text(r.get("future_section"), "")))
 
         if i < len(rows) - 1:
             # Big visual separation between tickers
@@ -610,6 +775,8 @@ def main():
         range_label = day
         DAILY_DIR.mkdir(parents=True, exist_ok=True)
         out_pdf = str(DAILY_DIR / f"annual_report_summary_{day}.pdf")
+        # Set run_date for Google Sheets sync
+        run_date = dt.date.fromisoformat(day)
 
         if not args.only_email:
             conn = mysql_connect(cfg)
@@ -626,7 +793,7 @@ def main():
             print(f"已生成每日汇总PDF: {out_pdf}")
             # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
             try:
-                sync_rows_to_google_sheet(cfg, rows)
+                sync_rows_to_google_sheet(cfg, rows, run_date=run_date)
             except Exception as e:
                 print(f"[sheets] 同步失败（忽略，不影响主流程）：{e}")
         else:
@@ -637,14 +804,17 @@ def main():
         # 手工模式不更新 last_sent_at（避免影响增量逻辑）
     else:
         # 模式2：按入库时间增量（m.created_at）
-        last_sent_at = load_last_sent_at()
+        last_generated_at = load_last_generated_at()
 
-        if args.today_only or last_sent_at is None:
+        if args.today_only or last_generated_at is None:
             start_at = dt.datetime.combine(dt.date.today(), dt.time(0, 0, 0))
         else:
-            start_at = last_sent_at
+            start_at = last_generated_at
 
         end_at = now
+
+        # Set run_date for Google Sheets sync
+        run_date = dt.date.today()
 
         start_ts = start_at.strftime("%Y-%m-%d %H:%M:%S")
         end_ts = end_at.strftime("%Y-%m-%d %H:%M:%S")
@@ -662,7 +832,9 @@ def main():
 
             if not rows:
                 print(f"{range_label} 无新增入库年报记录，不生成汇总PDF")
-                # 即使没有新增，也把 last_sent_at 推进到 now，避免下次重复扫描同一窗口
+                # 即使没有新增，也把 last_generated_iso 推进到 now，避免下次重复扫描同一窗口
+                save_last_generated_at(end_at)
+                # 同时推进 last_sent_iso（保持旧行为；你也可以只依赖 last_generated_iso）
                 save_last_sent_at(end_at)
                 return
 
@@ -670,9 +842,11 @@ def main():
             print(f"已生成每日汇总PDF: {out_pdf}")
             # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
             try:
-                sync_rows_to_google_sheet(cfg, rows)
+                sync_rows_to_google_sheet(cfg, rows, run_date=run_date)
             except Exception as e:
                 print(f"[sheets] 同步失败（忽略，不影响主流程）：{e}")
+            # 成功生成日报后推进 last_generated_iso：确保“已经出现在报表里的公司”不会在第二天重复出现
+            save_last_generated_at(end_at)
         else:
             if not Path(out_pdf).exists():
                 print(f"未找到PDF文件: {out_pdf}，无法仅发送邮件")
