@@ -355,18 +355,35 @@ class AnnualReportParser:
         t = _drop_block(t, r"(?:^|\n)释\s*义\b", [r"(?:^|\n)(?:词\s*汇\s*表|第一[章节]|第一节)\b"])
         t = _drop_block(t, r"(?:^|\n)词\s*汇\s*表\b", [r"(?:^|\n)(?:第一[章节]|第一节)\b"])
 
-        # 对于某些模板：重要提示会出现在最前面，直接截到更有信息密度的起点
-        # 优先：管理层综述/董事长致辞/董事会报告
-        for anchor in [
-            r"(?:^|\n)董事长致辞\b",
-            r"(?:^|\n)管理层综述\b",
+        # 对于某些模板：重要提示会出现在最前面。
+        # 这里不要“谁先在列表里就用谁”，而是：
+        # 1) 只要全文存在“第二章 董事会报告”，就优先从董事会报告开始（信息密度更高）；
+        # 2) 否则再退回到 管理层综述 / 董事会报告 / 董事长致辞。
+        preferred_starts = [
             r"(?:^|\n)第二章\s*董事会报告\b",
-            r"(?:^|\n)(?:董事会报告|董事会工作报告|董事会报告书)\b",
-        ]:
-            m = re.search(anchor, t)
-            if m:
-                t = t[m.start():]
-                break
+            r"(?:^|\n)(?:第二章\s*)?(?:董事会报告|董事会工作报告|董事会报告书)\b",
+            r"(?:^|\n)管理层综述\b",
+            r"(?:^|\n)董事长致辞\b",
+        ]
+
+        best_start = None
+        for pat in preferred_starts:
+            m = re.search(pat, t)
+            if not m:
+                continue
+            # Take the earliest match among preferred patterns
+            if best_start is None or m.start() < best_start:
+                best_start = m.start()
+
+        # NOTE: even if 董事长致辞 appears earlier, prefer 董事会报告 when present.
+        # If we found a 董事会报告 start anywhere, cut to that.
+        m_board_start = re.search(r"(?:^|\n)第二章\s*董事会报告\b", t)
+        if not m_board_start:
+            m_board_start = re.search(r"(?:^|\n)(?:第二章\s*)?(?:董事会报告|董事会工作报告|董事会报告书)\b", t)
+        if m_board_start:
+            t = t[m_board_start.start():]
+        elif best_start is not None:
+            t = t[best_start:]
 
         # --- 1) Summary / Overview: combine multiple useful sections ---
         # A) 管理层综述（若存在，优先）
@@ -411,8 +428,9 @@ class AnnualReportParser:
         )
 
         # Combine and de-duplicate (avoid repeating identical blocks)
+        # Prefer 董事会报告 over 董事长致辞 (致辞通常偏口号/情绪，信息密度较低)
         summary_parts: list[str] = []
-        for part in [overview, chairman, board]:
+        for part in [overview, board, chairman]:
             if not part:
                 continue
             p = part.strip()
@@ -424,6 +442,15 @@ class AnnualReportParser:
             summary_parts.append(p)
 
         summary_text = "\n\n".join(summary_parts).strip() if summary_parts else None
+
+        # If we have a substantial 董事会报告, use it as the primary business content.
+        # ZTE-like templates often have a long 董事长致辞 before 董事会报告; we don't want the letter.
+        if board and isinstance(board, str) and len(board) >= 1200:
+            # Keep overview only if it is meaningful; otherwise just use board.
+            if overview and isinstance(overview, str) and len(overview) >= 800:
+                summary_text = "\n\n".join([overview.strip(), board.strip()]).strip()
+            else:
+                summary_text = board.strip()
 
         # --- 2) Outlook: keyword-first fallback (do NOT rely on ordinal numbers) ---
         # Some annual reports (e.g., ZTE) use a different structure and do not have the standard

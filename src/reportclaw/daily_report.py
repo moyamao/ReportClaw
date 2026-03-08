@@ -834,8 +834,6 @@ def main():
                 print(f"{range_label} 无新增入库年报记录，不生成汇总PDF")
                 # 即使没有新增，也把 last_generated_iso 推进到 now，避免下次重复扫描同一窗口
                 save_last_generated_at(end_at)
-                # 同时推进 last_sent_iso（保持旧行为；你也可以只依赖 last_generated_iso）
-                save_last_sent_at(end_at)
                 return
 
             generate_daily_summary_pdf(rows, out_pdf, range_label)
@@ -880,8 +878,6 @@ def main():
             save_last_sent_at(end_at)
     else:
         print("邮件发送未启用（email.enabled=false 或使用了 --no-email）")
-        if not manual_publish_date:
-            save_last_sent_at(end_at)
 
 
 if __name__ == "__main__":
