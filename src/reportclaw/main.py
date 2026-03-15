@@ -134,6 +134,43 @@ def save_last_crawl_ts(path: Path, dt: datetime) -> None:
     except Exception:
         pass
 
+# ===============================
+# Same-day incremental crawl state helpers
+# ===============================
+def load_crawl_state_obj(path: Path) -> dict:
+    try:
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_crawl_state_obj(path: Path, obj: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def build_announcement_key(col: str, ann: dict) -> str:
+    """Build a stable unique key for an announcement.
+
+    Prefer announcementId when available; fall back to adjunctUrl/title/code/time.
+    """
+    ann_id = ann.get("announcementId") or ann.get("id")
+    if ann_id:
+        return f"{col}:id:{ann_id}"
+    adj = ann.get("adjunctUrl") or ""
+    if adj:
+        return f"{col}:adj:{adj}"
+    # last resort (less stable)
+    return f"{col}:mix:{ann.get('secCode')}|{ann.get('announcementTitle')}|{ann.get('announcementTime')}"
+
 
 # ===============================
 # 数据库客户端
@@ -287,6 +324,180 @@ class MySQLClient:
 # PDF解析器
 # ===============================
 class AnnualReportParser:
+    def normalize_page(self, text: str) -> str:
+        """Normalize a *single page* of extracted text.
+
+        Applies de-duplication and cleanup, but does NOT attempt to detect or remove tables/images or insert any placeholders.
+        """
+        if not text:
+            return ""
+
+        def _dedup_doubled_chars(s: str) -> str:
+            """De-duplicate common PDF text-layer artifacts.
+
+            This version fixes BOTH cases:
+              1) whole-line pairwise doubling: 全全球球 / 2222000022225555
+              2) pairwise-doubled SUBSTRINGS inside an otherwise normal line:
+                 22002255年全球...  / 回回升。 / （（如…））
+
+            We only collapse pairwise runs when the run is long enough (>= 3 pairs)
+            to avoid harming legitimate double characters.
+            """
+            if not s:
+                return s
+
+            s = s.strip()
+
+            # Fast-path: duplicated year patterns like 20252025 -> 2025
+            s = re.sub(r"((?:19|20)\d{2})\1", r"\1", s)
+
+            def _collapse_pair_runs(x: str) -> str:
+                out_chars: list[str] = []
+                i = 0
+                n = len(x)
+                # Only consider these chars for pair-run collapsing
+                punct = {"，", ",", "。", ".", "；", ";", "：", ":", "、", "（", "）", "(", ")"}
+
+                while i < n:
+                    # Try to detect a run of repeated pairs: AA BB CC ... emitted as AABBCC...
+                    if i + 1 < n and x[i] == x[i + 1]:
+                        ch = x[i]
+                        is_digit = ch.isdigit()
+                        is_cjk = "\u4e00" <= ch <= "\u9fff"
+                        is_punct = ch in punct
+
+                        if is_digit or is_cjk or is_punct:
+                            j = i
+                            pairs: list[str] = []
+                            while j + 1 < n and x[j] == x[j + 1]:
+                                pairs.append(x[j])
+                                j += 2
+
+                            # Collapse only when the run is long enough to be clearly an artifact
+                            if len(pairs) >= 3:
+                                out_chars.extend(pairs)
+                                i = j
+                                continue
+
+                    out_chars.append(x[i])
+                    i += 1
+
+                return "".join(out_chars)
+
+            # First collapse pairwise-doubled runs anywhere inside the line
+            s = _collapse_pair_runs(s)
+
+            # 1) Whole-line pairwise duplication detection (covers: 全全球球..., 2222000022225555...)
+            digit_ratio = sum(ch.isdigit() for ch in s) / max(len(s), 1)
+            if len(s) % 2 == 0:
+                total_pairs = len(s) // 2
+                same_pairs = 0
+                for i in range(0, len(s), 2):
+                    if s[i] == s[i + 1]:
+                        same_pairs += 1
+                if total_pairs > 0 and (same_pairs / total_pairs) >= 0.65:
+                    if len(s) >= 20 or digit_ratio >= 0.60:
+                        s = "".join(s[i] for i in range(0, len(s), 2))
+
+            # 2) Collapse consecutive duplicates.
+            #    - Digits/ASCII letters: collapse if run >= 2 (often duplicated text-layer)
+            #    - CJK: be more conservative; only collapse if run >= 3
+            #    - Punctuation: collapse if run >= 2 (avoid 、、、 （（（）））)
+            out = []
+            i = 0
+            n = len(s)
+            while i < n:
+                ch = s[i]
+                j = i + 1
+                while j < n and s[j] == ch:
+                    j += 1
+                run = j - i
+
+                is_ascii_alnum = ("0" <= ch <= "9") or ("A" <= ch <= "Z") or ("a" <= ch <= "z")
+                is_cjk = "\u4e00" <= ch <= "\u9fff"
+                is_punct = ch in {"，", ",", "。", ".", "；", ";", "：", ":", "、", "（", "）", "(", ")"}
+
+                if is_ascii_alnum:
+                    out.append(ch)
+                elif is_punct:
+                    out.append(ch)
+                elif is_cjk:
+                    if run >= 3:
+                        out.append(ch)
+                    else:
+                        out.extend([ch] * run)
+                else:
+                    out.extend([ch] * run)
+
+                i = j
+
+            collapsed = "".join(out)
+
+            # 3) Final light collapse for adjacent duplicates in alnum / a few symbols.
+            dup_adj = 0
+            for k in range(len(collapsed) - 1):
+                if collapsed[k] == collapsed[k + 1] and (collapsed[k].isalnum() or collapsed[k] in {"、", "（", "）", "(", ")"}):
+                    dup_adj += 1
+            if (len(collapsed) - 1) > 0 and (dup_adj / (len(collapsed) - 1)) >= 0.20:
+                out2 = [collapsed[0]]
+                for ch in collapsed[1:]:
+                    if ch == out2[-1] and (ch.isalnum() or ch in {"、", "（", "）", "(", ")"}):
+                        continue
+                    out2.append(ch)
+                collapsed = "".join(out2)
+
+            return collapsed
+
+        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0c", "\n")
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        lines = []
+        for raw in text.split("\n"):
+            line = (raw or "").replace("\u3000", " ").strip()
+            line = _dedup_doubled_chars(line)
+            if not line:
+                continue
+            lines.append(line)
+        out = "\n".join(lines)
+        out = out.replace("\u3000", " ")
+        out = re.sub(r"[ \t]+\n", "\n", out)
+        out = re.sub(r"[ \t]+", " ", out)
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        # Punctuation cleanup: collapse repeated runs (include 顿号/括号)
+        out = re.sub(r"[，,]{2,}", "，", out)
+        out = re.sub(r"[、]{2,}", "、", out)
+        out = re.sub(r"[；;]{2,}", "；", out)
+        out = re.sub(r"[。\.]{2,}", "。", out)
+        out = re.sub(r"[：:]{2,}", "：", out)
+        out = re.sub(r"[（(]{2,}", "（", out)
+        out = re.sub(r"[）)]{2,}", "）", out)
+
+        # Collapse adjacent punctuation even if mixed with spaces
+        out = re.sub(r"([，,、；;。\.：:])(?:\s*\1)+", r"\1", out)
+        out = re.sub(r"[，,、；;。\.：:]\s*[，,、；;。\.：:]\s*", lambda m: m.group(0)[0], out)
+        out = re.sub(r"（\s*（+", "（", out)
+        out = re.sub(r"）\s*）+", "）", out)
+
+        # --- Extra de-dup: consecutive duplicate lines / short trailing sentences ---
+        lines2: list[str] = []
+        prev = ""
+        for ln in out.split("\n"):
+            s = (ln or "").strip()
+            if not s:
+                continue
+            # 1) exact consecutive duplicate line
+            if prev and s == prev:
+                continue
+            # 2) very short duplicated tail (often PDF text-layer repeats the sentence ending)
+            #    e.g. "回升。" appears twice across layout blocks
+            if prev and len(s) <= 8 and (prev.endswith(s) or prev.endswith(s + "。") or prev.endswith(s + "；")):
+                continue
+            lines2.append(s)
+            prev = s
+        out = "\n".join(lines2)
+
+        # Also collapse accidental double-sentence repetition inside the same line: “回升。回升。”
+        out = re.sub(r"([\u4e00-\u9fff]{1,6}[。；！？])\s*\1", r"\1", out)
+        return out
     MAJOR_HEADING_KEYWORDS = [
         "核心竞争力", "核心竞争力分析",
         "主营业务分析", "主营业务",
@@ -344,6 +555,91 @@ class AnnualReportParser:
             return None
 
         t = raw
+        # --- helper: TOC-like detection / removal ---
+        _toc_line_re = re.compile(r"[\.·…]{6,}\s*\d{1,4}$")
+        _toc_dense_re = re.compile(r"^[^\n]{1,120}[\.·…]{6,}[^\n]{0,40}\d{1,4}$")
+
+        def _is_toc_like_line(line: str) -> bool:
+            s = (line or "").strip()
+            if not s:
+                return False
+            if _toc_line_re.search(s):
+                return True
+            if _toc_dense_re.search(s):
+                return True
+            if ("……" in s or "..." in s) and re.search(r"\d{1,4}$", s):
+                return True
+            return False
+
+        def _strip_toc_block(text: str) -> str:
+            """Remove TOC/目录 blocks that often cause false hits (e.g. '第二章董事会报告....12')."""
+            if not text:
+                return text
+            lines = text.split("\n")
+
+            # Heuristic A: if we see '目录' early, drop subsequent TOC-like lines until a real chapter heading.
+            out = []
+            in_toc = False
+            saw_dir = False
+            for raw_line in lines:
+                line = (raw_line or "").strip()
+
+                if not saw_dir and (line == "目录" or "目 录" in line):
+                    saw_dir = True
+                    in_toc = True
+                    continue
+
+                if in_toc:
+                    if _is_toc_like_line(line):
+                        continue
+                    # End TOC when we hit a real-looking heading line
+                    if (
+                        re.match(r"^(第[一二三四五六七八九十]{1,3}[章节])", line)
+                        or re.match(r"^\d+(?:[\.．]\d+)*", line)
+                        or re.match(r"^[一二三四五六七八九十]{1,3}、", line)
+                    ):
+                        in_toc = False
+                        out.append(raw_line)
+                    else:
+                        continue
+                else:
+                    out.append(raw_line)
+
+            text2 = "\n".join(out)
+
+            # Heuristic B: even without explicit '目录', remove a dense TOC prefix if the first chunk is TOC-heavy.
+            head = lines[:200]
+            if head:
+                toc_like_cnt = sum(1 for x in head if _is_toc_like_line((x or "").strip()))
+                if toc_like_cnt >= 15:
+                    out2 = []
+                    dropping = True
+                    for raw_line in lines:
+                        line = (raw_line or "").strip()
+                        if dropping and _is_toc_like_line(line):
+                            continue
+                        dropping = False
+                        out2.append(raw_line)
+                    text2 = "\n".join(out2)
+
+            return text2
+
+        def _find_heading_pos(text: str, patterns: list[str]) -> int | None:
+            """Find first non-TOC occurrence of any heading pattern."""
+            if not text:
+                return None
+            for pat in patterns:
+                for m in re.finditer(pat, text):
+                    ls = text.rfind("\n", 0, m.start())
+                    le = text.find("\n", m.start())
+                    line = text[(ls + 1 if ls >= 0 else 0):(le if le >= 0 else len(text))].strip()
+                    if _is_toc_like_line(line):
+                        continue
+                    return m.start()
+            return None
+
+        # Drop TOC-like blocks early
+        t = _strip_toc_block(t)
 
         # --- helper: drop common boilerplate blocks ---
         def _drop_block(src: str, start_pat: str, end_pats: list[str]) -> str:
@@ -351,86 +647,78 @@ class AnnualReportParser:
             return src.replace(blk, "") if blk else src
 
         # 目录/释义/词汇表 经常会非常长，优先剔除
-        t = _drop_block(t, r"(?:^|\n)目\s*录\b", [r"(?:^|\n)第一[章节]\b", r"(?:^|\n)第一节\b"])
-        t = _drop_block(t, r"(?:^|\n)释\s*义\b", [r"(?:^|\n)(?:词\s*汇\s*表|第一[章节]|第一节)\b"])
-        t = _drop_block(t, r"(?:^|\n)词\s*汇\s*表\b", [r"(?:^|\n)(?:第一[章节]|第一节)\b"])
+        t = _drop_block(t, r"(?:^|\n)目\s*录", [r"(?:^|\n)第一[章节]", r"(?:^|\n)第一节"])
+        t = _drop_block(t, r"(?:^|\n)释\s*义", [r"(?:^|\n)(?:词\s*汇\s*表|第一[章节]|第一节)"])
+        t = _drop_block(t, r"(?:^|\n)词\s*汇\s*表", [r"(?:^|\n)(?:第一[章节]|第一节)"])
 
         # 对于某些模板：重要提示会出现在最前面。
-        # 这里不要“谁先在列表里就用谁”，而是：
-        # 1) 只要全文存在“第二章 董事会报告”，就优先从董事会报告开始（信息密度更高）；
-        # 2) 否则再退回到 管理层综述 / 董事会报告 / 董事长致辞。
+        # 这里我们只做“可用内容”起点定位，并且强制跳过目录/TOC 行的误命中。
         preferred_starts = [
-            r"(?:^|\n)第二章\s*董事会报告\b",
-            r"(?:^|\n)(?:第二章\s*)?(?:董事会报告|董事会工作报告|董事会报告书)\b",
-            r"(?:^|\n)管理层综述\b",
-            r"(?:^|\n)董事长致辞\b",
+            r"(?:^|\n)第二章\s*董事会报告",
+            r"(?:^|\n)(?:第二章\s*)?(?:董事会报告|董事会工作报告|董事会报告书)",
+            r"(?:^|\n)管理层综述",
+            r"(?:^|\n)董事长致辞",
         ]
 
-        best_start = None
-        for pat in preferred_starts:
-            m = re.search(pat, t)
-            if not m:
-                continue
-            # Take the earliest match among preferred patterns
-            if best_start is None or m.start() < best_start:
-                best_start = m.start()
-
-        # NOTE: even if 董事长致辞 appears earlier, prefer 董事会报告 when present.
-        # If we found a 董事会报告 start anywhere, cut to that.
-        m_board_start = re.search(r"(?:^|\n)第二章\s*董事会报告\b", t)
-        if not m_board_start:
-            m_board_start = re.search(r"(?:^|\n)(?:第二章\s*)?(?:董事会报告|董事会工作报告|董事会报告书)\b", t)
-        if m_board_start:
-            t = t[m_board_start.start():]
-        elif best_start is not None:
-            t = t[best_start:]
+        board_pos = _find_heading_pos(t, [preferred_starts[0], preferred_starts[1]])
+        if board_pos is not None:
+            t = t[board_pos:]
+        else:
+            any_pos = _find_heading_pos(t, preferred_starts)
+            if any_pos is not None:
+                t = t[any_pos:]
 
         # --- 1) Summary / Overview: combine multiple useful sections ---
         # A) 管理层综述（若存在，优先）
         overview = self._extract_between_markers(
             t,
-            r"(?:^|\n)管理层综述\b",
+            r"(?:^|\n)管理层综述",
             [
-                r"(?:^|\n)董事长致辞\b",
-                r"(?:^|\n)第二章\s*董事会报告\b",
-                r"(?:^|\n)董事会报告\b",
-                r"(?:^|\n)第三节\s*管理层讨论与分析\b",
-                r"(?:^|\n)公司治理\b",
-                r"(?:^|\n)重要事项\b",
-                r"(?:^|\n)(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]\s*报告期内核心竞争力分析\b",
+                r"(?:^|\n)董事长致辞",
+                r"(?:^|\n)第二章\s*董事会报告",
+                r"(?:^|\n)董事会报告",
+                r"(?:^|\n)第三节\s*管理层讨论与分析",
+                r"(?:^|\n)公司治理",
+                r"(?:^|\n)重要事项",
+                r"(?:^|\n)(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]\s*报告期内核心竞争力分析",
             ],
         )
 
         # B) 董事长致辞（若存在）
         chairman = self._extract_between_markers(
             t,
-            r"(?:^|\n)董事长致辞\b",
+            r"(?:^|\n)董事长致辞",
             [
-                r"(?:^|\n)第二章\s*董事会报告\b",
-                r"(?:^|\n)董事会报告\b",
-                r"(?:^|\n)第三章\b",
-                r"(?:^|\n)第三节\s*管理层讨论与分析\b",
-                r"(?:^|\n)公司治理\b",
-                r"(?:^|\n)重要事项\b",
+                r"(?:^|\n)第二章\s*董事会报告",
+                r"(?:^|\n)董事会报告",
+                r"(?:^|\n)第三章",
+                r"(?:^|\n)第三节\s*管理层讨论与分析",
+                r"(?:^|\n)公司治理",
+                r"(?:^|\n)重要事项",
             ],
         )
 
         # C) 董事会报告（不同模板写法差异大）
         board = self._extract_between_markers(
             t,
-            r"(?:^|\n)(?:第二章\s*)?(?:董事会报告|董事会工作报告|董事会报告书)\b",
+            r"(?:^|\n)(?:第二章\s*)?(?:董事会报告|董事会工作报告|董事会报告书)",
             [
-                r"(?:^|\n)第三章\b",
-                r"(?:^|\n)第三节\s*管理层讨论与分析\b",
-                r"(?:^|\n)公司治理\b",
-                r"(?:^|\n)重要事项\b",
+                r"(?:^|\n)第三章",
+                r"(?:^|\n)第三节\s*管理层讨论与分析",
+                r"(?:^|\n)公司治理",
+                r"(?:^|\n)重要事项",
             ],
         )
+        # ✅ 研究向：只要有“董事会报告”，就不要“董事长致辞”
+        if board and isinstance(board, str) and len(board.strip()) >= 200:
+            chairman = None
+
 
         # Combine and de-duplicate (avoid repeating identical blocks)
         # Prefer 董事会报告 over 董事长致辞 (致辞通常偏口号/情绪，信息密度较低)
         summary_parts: list[str] = []
-        for part in [overview, board, chairman]:
+        for part in ([overview, board] if (board and isinstance(board, str) and len(board.strip()) >= 200)
+        else [overview, board, chairman]):
             if not part:
                 continue
             p = part.strip()
@@ -446,8 +734,11 @@ class AnnualReportParser:
         # If we have a substantial 董事会报告, use it as the primary business content.
         # ZTE-like templates often have a long 董事长致辞 before 董事会报告; we don't want the letter.
         if board and isinstance(board, str) and len(board) >= 1200:
-            # Keep overview only if it is meaningful; otherwise just use board.
-            if overview and isinstance(overview, str) and len(overview) >= 800:
+            # Only keep overview when it is substantial AND clearly not contained by the board report.
+            if (overview and isinstance(overview, str)
+                and len(overview.strip()) >= 1500
+                and (overview.strip() not in board)
+                and (board.strip() not in overview)):
                 summary_text = "\n\n".join([overview.strip(), board.strip()]).strip()
             else:
                 summary_text = board.strip()
@@ -462,7 +753,7 @@ class AnnualReportParser:
         # e.g. "2.3 2026年业务展望和面对的经营风险" / "2．3 2026年业务展望…"
         # NOTE: normalize() removed normal spaces, but may keep newlines; be tolerant.
         m_head = re.search(
-            r"(?:^|\n)\s*2\s*[\.．]\s*3(?:\s*[\.．]\s*\d+)?\s*[^\n]{0,80}?(?:2026\s*年?)?\s*业务展望[^\n]{0,120}?(?:经营风险|风险)?\b",
+            r"(?:^|\n)\s*2\s*[\.．]\s*3(?:\s*[\.．]\s*\d+)?\s*[^\n]{0,80}?(?:2026\s*年?)?\s*业务展望[^\n]{0,120}?(?:经营风险|风险)?",
             t,
         )
 
@@ -480,38 +771,62 @@ class AnnualReportParser:
                     out_idx = idx
                     break
 
+        # 2.1 Prefer explicit dot-number headings (e.g. 2.3 / 2.3.1) first, and anchor at the heading start.
+        head_patterns = [
+            # 2.3 2026年业务展望和面对的经营风险 / 2．3 业务展望...
+            r"(?:^|\n)\s*2\s*[\.．]\s*3(?:\s*[\.．]\s*\d+)?\s*[^\n]{0,120}?(?:2026\s*年?)?\s*业务展望[^\n]{0,160}?",
+            # Generic dot headings that include 业务展望
+            r"(?:^|\n)\s*\d+(?:[\.．]\d+){1,3}\s*[^\n]{0,80}?业务展望[^\n]{0,160}?",
+        ]
+        m_head = None
+        for pat in head_patterns:
+            for m in re.finditer(pat, t):
+                ls = t.rfind("\n", 0, m.start())
+                le = t.find("\n", m.start())
+                line = t[(ls + 1 if ls >= 0 else 0):(le if le >= 0 else len(t))].strip()
+                if _is_toc_like_line(line):
+                    continue
+                m_head = m
+                break
+            if m_head:
+                break
+
+        out_idx = None
+        if m_head:
+            out_idx = m_head.start()
+        else:
+            # 2.2 Fallback: keyword only (still reject TOC-like line hits)
+            for kw in ["2026年业务展望", "2026年业务发展展望", "业务展望"]:
+                for m in re.finditer(re.escape(kw), t):
+                    ls = t.rfind("\n", 0, m.start())
+                    le = t.find("\n", m.start())
+                    line = t[(ls + 1 if ls >= 0 else 0):(le if le >= 0 else len(t))].strip()
+                    if _is_toc_like_line(line):
+                        continue
+                    out_idx = m.start()
+                    break
+                if out_idx is not None:
+                    break
+
         if out_idx is not None:
-            # Start from the beginning of the line that contains the keyword.
-            line_start = t.rfind("\n", 0, out_idx)
-            start = 0 if line_start < 0 else (line_start + 1)
+            start = out_idx
+            tail = t[start:]
 
-            tail = t[out_idx:]
-
-            # End at the next major heading.
-            # Be tolerant: extracted text sometimes loses newlines around headings.
+            # End at next major heading / next dot heading / next big ordinal chapter.
             end_patterns = [
-                # Next sibling subsection (e.g. 2.3.2 / 2.3.3 ...) or next major section (2.4 / 3.)
-                r"(?:\n\s*|\s)2\s*[\.．]\s*3\s*[\.．]\s*[2-9]",
-                r"(?:\n\s*|\s)2\s*[\.．]\s*4\b",
-                r"(?:\n\s*|\s)3\s*[\.．]\s*\d",
+                r"(?:^|\n)\s*2\s*[\.．]\s*3\s*[\.．]\s*[2-9]",
+                r"(?:^|\n)\s*2\s*[\.．]\s*4\b",
+                r"(?:^|\n)\s*3\s*[\.．]\s*\d",
 
-                # Also accept heading without explicit whitespace/newline before it (rare but happens)
-                r"2\s*[\.．]\s*4\b",
-                r"3\s*[\.．]\s*\d\b",
+                r"(?:^|\n)\s*(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]",
+                r"(?:^|\n)\s*第\s*[一二三四五六七八九十]{1,3}\s*[章节]",
 
-                # Next Chinese/Arabic major ordinal like 十二、/12、
-                r"(?:\n)\s*(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]",
-
-                # Next chapter/section style
-                r"(?:\n)\s*第\s*[一二三四五六七八九十]{1,3}\s*[章节]",
-
-                # Strong stop words (chapters we never want inside outlook)
-                r"(?:\n)\s*(?:十\s*二|12)\s*[、\.．:：]?\s*报告期内接待调研",
-                r"(?:\n)\s*(?:十\s*三|13)\s*[、\.．:：]?\s*市值管理",
-                r"(?:\n)\s*(?:目\s*录|释\s*义|词\s*汇\s*表)",
-                r"(?:\n)\s*公司治理",
-                r"(?:\n)\s*重要事项",
-                r"(?:\n)\s*(?:可能面对的风险|风险因素|风险提示)",
+                r"(?:^|\n)\s*(?:十\s*二|12)\s*[、\.．:：]?\s*报告期内接待调研",
+                r"(?:^|\n)\s*(?:十\s*三|13)\s*[、\.．:：]?\s*市值管理",
+                r"(?:^|\n)\s*(?:目\s*录|释\s*义|词\s*汇\s*表)",
+                r"(?:^|\n)\s*公司治理",
+                r"(?:^|\n)\s*重要事项",
+                r"(?:^|\n)\s*(?:可能面对的风险|风险因素|风险提示)",
             ]
 
             end = None
@@ -519,9 +834,8 @@ class AnnualReportParser:
                 m_end = re.search(ep, tail)
                 if not m_end:
                     continue
-                cand = out_idx + m_end.start()
-                # Avoid cutting too early (must be meaningfully after the start)
-                if cand <= start + 50:
+                cand = start + m_end.start()
+                if cand <= start + 80:
                     continue
                 end = cand if end is None else min(end, cand)
 
@@ -569,12 +883,166 @@ class AnnualReportParser:
             "full_mda": full,
         }
 
+    def extract_future_from_fulltext(self, pdf_path: str, *, max_pages: int = 260) -> str | None:
+        """Fallback: extract 'future outlook' from full report text (not limited to 第三节).
+
+        Why:
+        - Some reports put outlook in '十一、公司未来发展的展望' (outside 第三节).
+        - TOC/Glossary often contains the same headings and causes false hits, so we drop them first.
+        """
+        try:
+            raw = self.extract_text(pdf_path, page_numbers=list(range(0, max_pages)))
+        except Exception:
+            raw = ""
+        if not raw:
+            return None
+
+        t = raw
+
+        # Extra: strip TOC-like lines to avoid matching headings from目录
+        def _is_toc_like_line_ft(line: str) -> bool:
+            s = (line or "").strip()
+            if not s:
+                return False
+            if re.search(r"[\.·…]{6,}\s*\d{1,4}$", s):
+                return True
+            if ("……" in s or "..." in s) and re.search(r"\d{1,4}$", s):
+                return True
+            return False
+
+        lines = t.split("\n")
+        out = []
+        in_toc = False
+        for raw_line in lines:
+            line = (raw_line or "").strip()
+            if not in_toc and (line == "目录" or "目 录" in line):
+                in_toc = True
+                continue
+            if in_toc:
+                if _is_toc_like_line_ft(line):
+                    continue
+                if (
+                    re.match(r"^(第[一二三四五六七八九十]{1,3}[章节])", line)
+                    or re.match(r"^\d+(?:[\.．]\d+)*", line)
+                    or re.match(r"^[一二三四五六七八九十]{1,3}、", line)
+                ):
+                    in_toc = False
+                    out.append(raw_line)
+                else:
+                    continue
+            else:
+                out.append(raw_line)
+        t = "\n".join(out)
+
+        # Drop long boilerplates that frequently contain outlook headings in TOC and cause false matches.
+        def _drop_block(src: str, start_pat: str, end_pats: list[str]) -> str:
+            blk = self._extract_between_markers(src, start_pat, end_pats)
+            return src.replace(blk, "") if blk else src
+
+        t = _drop_block(t, r"(?:^|\n)目\s*录",
+                        [r"(?:^|\n)第一[章节]\b", r"(?:^|\n)第一节\b", r"(?:^|\n)一、\b", r"(?:^|\n)1、\b"])
+        t = _drop_block(t, r"(?:^|\n)释\s*义",
+                        [r"(?:^|\n)(?:词\s*汇\s*表|名\s*词\s*解\s*释|第一[章节]|第一节|一、|1、)\b"])
+        t = _drop_block(t, r"(?:^|\n)词\s*汇\s*表",
+                        [r"(?:^|\n)(?:名\s*词\s*解\s*释|第一[章节]|第一节|一、|1、)\b"])
+        t = _drop_block(t, r"(?:^|\n)名\s*词\s*解\s*释",
+                        [r"(?:^|\n)(?:第一[章节]|第一节|一、|1、)\b"])
+        t = _drop_block(t, r"(?:^|\n)重\s*要\s*提\s*示",
+                        [r"(?:^|\n)(?:目\s*录|第一[章节]|第一节|一、|1、)\b"])
+
+        # Strong stop headings: if extracted section leaks into these chapters, cut immediately.
+        end_title_keywords = [
+            "可能面对的风险", "风险因素", "风险提示", "风险",
+            "公司治理", "重要事项", "投资者关系", "市值管理",
+            "财务报告", "财务会计报告", "备查文件",
+            "报告期内接待调研", "接待调研", "调研、沟通、采访",
+            "释义", "词汇表", "名词解释", "目录",
+        ]
+
+        # Prefer explicit outlook headings first; then fall back to generic ones.
+        keywords = [
+            "2026年业务展望",
+            "REGEX:(?:20\\d{2}年)?业务展望",
+            "公司未来发展的展望",
+            "未来发展的展望",
+            "未来发展展望",
+            "公司关于公司未来发展的讨论与分析",
+            "公司关于未来发展的讨论与分析",
+            "关于公司未来发展的讨论与分析",
+            "未来发展战略",
+            "未来发展规划",
+            "发展战略",
+            "发展规划",
+            "经营展望",
+        ]
+
+        fut = self.extract_section_by_keywords(
+            t,
+            keywords=keywords,
+            fallback_ordinals=None,
+            end_title_keywords=end_title_keywords,
+        )
+
+        if not fut:
+            return None
+
+        # Hard safety trim for common leaks (some PDFs include them right after outlook chapter)
+        leak_patterns = [
+            r"(?:^|\n|\b)\s*(?:十\s*二|12)\s*[、\.．:：]?\s*报告期内接待调研",
+            r"(?:^|\n|\b)\s*(?:十\s*三|13)\s*[、\.．:：]?\s*市值管理",
+        ]
+        cut_at = None
+        for pat in leak_patterns:
+            m_leak = re.search(pat, fut)
+            if m_leak:
+                cut_at = m_leak.start() if cut_at is None else min(cut_at, m_leak.start())
+        if cut_at is not None:
+            fut = fut[:cut_at].strip()
+
+        # Too short usually indicates TOC-like false hit.
+        if len(fut) < 200:
+            return None
+
+        return self._truncate(fut, 40000)
+
+
     def extract_text(self, pdf_path, page_numbers=None):
-        # 使用 pdfminer 按页提取（支持只读指定页）
-        text = pdfminer_extract_text(pdf_path, page_numbers=page_numbers)
+        """Extract text from PDF.
+
+        NOTE: pdfminer_extract_text reparses the whole file each call and can be extremely slow
+        when called page-by-page in a loop. For heavy/complex PDFs, prefer using
+        `extract_text_with_pdfplumber()` which keeps the PDF parsed.
+        """
+        try:
+            text = pdfminer_extract_text(pdf_path, page_numbers=page_numbers)
+        except Exception:
+            text = ""
         if not text:
             return ""
         return self.normalize(text)
+
+    def extract_text_with_pdfplumber(self, pdf, page_numbers=None):
+        """Fast path: extract text using an already-opened pdfplumber PDF object.
+
+        This avoids reparsing the full PDF for every page, which can look like a hang.
+        Returns normalized text.
+        """
+        if page_numbers is None:
+            page_numbers = list(range(len(pdf.pages)))
+        chunks = []
+        for p in page_numbers:
+            if p < 0 or p >= len(pdf.pages):
+                continue
+            try:
+                t = pdf.pages[p].extract_text() or ""
+            except Exception:
+                t = ""
+            if t:
+                chunks.append(self.normalize_page(t))
+        if not chunks:
+            return ""
+        # Join already-normalized pages; keep a single newline separator.
+        return "\n".join(chunks)
 
     def build_fallback_mda(self, pdf_path: str, reason: str, page_count: int) -> dict:
         """Fallback payload for DB so the report is not ignored even if MDA parsing fails.
@@ -622,69 +1090,234 @@ class AnnualReportParser:
         # 统一换行/去除不可见分页符
         text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0c", "\n")
 
-        # 先做一次基本清理
-        text = re.sub(r"\n+", "\n", text)
+        # 保留段落空行：只把 3 个以上连续换行压到 2 个（不要把所有空行压没）
+        text = re.sub(r"\n{3,}", "\n\n", text)
 
-        # 按行过滤页眉/页脚/页码等噪声
-        lines = []
+        def _dedup_doubled_chars(s: str) -> str:
+            """De-duplicate common PDF text-layer artifacts.
+
+            This version fixes BOTH cases:
+              1) whole-line pairwise doubling: 全全球球 / 2222000022225555
+              2) pairwise-doubled SUBSTRINGS inside an otherwise normal line:
+                 22002255年全球...  / 回回升。 / （（如…））
+
+            We only collapse pairwise runs when the run is long enough (>= 3 pairs)
+            to avoid harming legitimate double characters.
+            """
+            if not s:
+                return s
+
+            s = s.strip()
+
+            # Fast-path: duplicated year patterns like 20252025 -> 2025
+            s = re.sub(r"((?:19|20)\d{2})\1", r"\1", s)
+
+            def _collapse_pair_runs(x: str) -> str:
+                out_chars: list[str] = []
+                i = 0
+                n = len(x)
+                # Only consider these chars for pair-run collapsing
+                punct = {"，", ",", "。", ".", "；", ";", "：", ":", "、", "（", "）", "(", ")"}
+
+                while i < n:
+                    # Try to detect a run of repeated pairs: AA BB CC ... emitted as AABBCC...
+                    if i + 1 < n and x[i] == x[i + 1]:
+                        ch = x[i]
+                        is_digit = ch.isdigit()
+                        is_cjk = "\u4e00" <= ch <= "\u9fff"
+                        is_punct = ch in punct
+
+                        if is_digit or is_cjk or is_punct:
+                            j = i
+                            pairs: list[str] = []
+                            while j + 1 < n and x[j] == x[j + 1]:
+                                pairs.append(x[j])
+                                j += 2
+
+                            # Collapse only when the run is long enough to be clearly an artifact
+                            if len(pairs) >= 3:
+                                out_chars.extend(pairs)
+                                i = j
+                                continue
+
+                    out_chars.append(x[i])
+                    i += 1
+
+                return "".join(out_chars)
+
+            # First collapse pairwise-doubled runs anywhere inside the line
+            s = _collapse_pair_runs(s)
+
+            # 1) Whole-line pairwise duplication detection (covers: 全全球球..., 2222000022225555...)
+            digit_ratio = sum(ch.isdigit() for ch in s) / max(len(s), 1)
+            if len(s) % 2 == 0:
+                total_pairs = len(s) // 2
+                same_pairs = 0
+                for i in range(0, len(s), 2):
+                    if s[i] == s[i + 1]:
+                        same_pairs += 1
+                if total_pairs > 0 and (same_pairs / total_pairs) >= 0.65:
+                    if len(s) >= 20 or digit_ratio >= 0.60:
+                        s = "".join(s[i] for i in range(0, len(s), 2))
+
+            # 2) Collapse consecutive duplicates.
+            #    - Digits/ASCII letters: collapse if run >= 2 (often duplicated text-layer)
+            #    - CJK: be more conservative; only collapse if run >= 3
+            #    - Punctuation: collapse if run >= 2 (avoid 、、、 （（（）））)
+            out = []
+            i = 0
+            n = len(s)
+            while i < n:
+                ch = s[i]
+                j = i + 1
+                while j < n and s[j] == ch:
+                    j += 1
+                run = j - i
+
+                is_ascii_alnum = ("0" <= ch <= "9") or ("A" <= ch <= "Z") or ("a" <= ch <= "z")
+                is_cjk = "\u4e00" <= ch <= "\u9fff"
+                is_punct = ch in {"，", ",", "。", ".", "；", ";", "：", ":", "、", "（", "）", "(", ")"}
+
+                if is_ascii_alnum:
+                    out.append(ch)
+                elif is_punct:
+                    out.append(ch)
+                elif is_cjk:
+                    if run >= 3:
+                        out.append(ch)
+                    else:
+                        out.extend([ch] * run)
+                else:
+                    out.extend([ch] * run)
+
+                i = j
+
+            collapsed = "".join(out)
+
+            # 3) Final light collapse for adjacent duplicates in alnum / a few symbols.
+            dup_adj = 0
+            for k in range(len(collapsed) - 1):
+                if collapsed[k] == collapsed[k + 1] and (collapsed[k].isalnum() or collapsed[k] in {"、", "（", "）", "(", ")"}):
+                    dup_adj += 1
+            if (len(collapsed) - 1) > 0 and (dup_adj / (len(collapsed) - 1)) >= 0.20:
+                out2 = [collapsed[0]]
+                for ch in collapsed[1:]:
+                    if ch == out2[-1] and (ch.isalnum() or ch in {"、", "（", "）", "(", ")"}):
+                        continue
+                    out2.append(ch)
+                collapsed = "".join(out2)
+
+            return collapsed
+
+        lines: list[str] = []
         for raw in text.split("\n"):
-            line = raw.strip()
+            line = (raw or "").replace("\u3000", " ").strip()
+            line = _dedup_doubled_chars(line)
             if not line:
                 continue
 
+            # 0) 纯标点/分隔符噪声
+            if re.fullmatch(r"[，,。\.；;：:、]{2,}", line):
+                continue
             # 1) 纯页码行（如：11）
             if re.fullmatch(r"\d{1,4}", line):
                 continue
-
             # 1.1) 形如 14/248 的页码
             if re.fullmatch(r"\d{1,4}\s*/\s*\d{1,4}", line):
                 continue
-
             # 1.2) 常见页眉（公司名 + 年度报告）
             if ("年度报告" in line) and ("股份有限公司" in line):
                 continue
-
             # 1.3) “公司代码/公司简称”页眉
             if line.startswith("公司代码：") or line.startswith("公司简称：") or ("公司代码：" in line):
                 continue
-
-            # 1.4) 仅公司名一行的页眉（常见：XXX股份有限公司 / XXX有限公司）
+            # 1.4) 仅公司名一行的页眉
             if (line.endswith("股份有限公司") or line.endswith("有限公司")) and len(line) <= 30:
                 continue
-
-            # 1.5) 仅“XXXX年年度报告/年度报告全文/年度报告”一行的页眉（常与公司名分成两行）
+            # 1.5) 仅“年度报告”一行的页眉
             if ("年度报告" in line) and len(line) <= 20:
                 continue
-
-            # 2) 表格边框/分隔符（如：---+、|、+--- 等）
+            # 2) 表格边框/分隔符
             if re.fullmatch(r"[-+|]{3,}", line):
                 continue
-
             # 3) 常见年报页眉（包含“年度报告全文”）
             if "年度报告全文" in line:
                 continue
 
             lines.append(line)
 
-        # 最后再做你原先的处理：去掉所有空格，并压缩多余空行
         text = "\n".join(lines)
-        text = text.replace(" ", "")
-        text = re.sub(r"\n+", "\n", text)
+        text = text.replace("\u3000", " ")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        # Punctuation cleanup: collapse repeated runs (include 顿号/括号)
+        text = re.sub(r"[，,]{2,}", "，", text)
+        text = re.sub(r"[、]{2,}", "、", text)
+        text = re.sub(r"[；;]{2,}", "；", text)
+        text = re.sub(r"[。\.]{2,}", "。", text)
+        text = re.sub(r"[：:]{2,}", "：", text)
+        text = re.sub(r"[（(]{2,}", "（", text)
+        text = re.sub(r"[）)]{2,}", "）", text)
+
+        # Collapse adjacent punctuation even if mixed with spaces
+        text = re.sub(r"([，,、；;。\.：:])(?:\s*\1)+", r"\1", text)
+        text = re.sub(r"[，,、；;。\.：:]\s*[，,、；;。\.：:]\s*", lambda m: m.group(0)[0], text)
+        text = re.sub(r"（\s*（+", "（", text)
+        text = re.sub(r"）\s*）+", "）", text)
+
+        # --- Extra de-dup: consecutive duplicate lines / short trailing sentences ---
+        _lines = []
+        _prev = ""
+        for _ln in text.split("\n"):
+            _s = (_ln or "").strip()
+            if not _s:
+                continue
+            if _prev and _s == _prev:
+                continue
+            if _prev and len(_s) <= 8 and (_prev.endswith(_s) or _prev.endswith(_s + "。") or _prev.endswith(_s + "；")):
+                continue
+            _lines.append(_s)
+            _prev = _s
+        text = "\n".join(_lines)
+
+        # Collapse duplicated short sentence inside the same line: “回升。回升。”
+        text = re.sub(r"([\u4e00-\u9fff]{1,6}[。；！？])\s*\1", r"\1", text)
+
         return text
 
     def extract_mda(self, pdf_path):
+
+        # IMPORTANT: do not call pdfminer_extract_text page-by-page in a loop (very slow on some PDFs).
+        # Open once with pdfplumber and reuse to avoid repeated full-file parsing.
+        try:
+            _pdf = pdfplumber.open(pdf_path)
+        except Exception:
+            _pdf = None
+
+        def _page_text(p: int) -> str:
+            if _pdf is None:
+                return self.extract_text(pdf_path, page_numbers=[p])
+            return self.extract_text_with_pdfplumber(_pdf, page_numbers=[p])
 
         # 1) 目录定位：先在前20页里寻找“目录”所在页，再只在目录附近提取第三节页码
         start_page = None
         toc_page = None
         for p in range(0, 20):
-            t = self.extract_text(pdf_path, page_numbers=[p])
+            t = _page_text(p)
             if t and ("目录" in t or "目 录" in t):
                 toc_page = p
                 break
 
         toc_pages = list(range(toc_page, min(toc_page + 4, 20))) if toc_page is not None else list(range(0, 6))
-        toc_text = self.extract_text(pdf_path, page_numbers=toc_pages)
+        # IMPORTANT: reuse the already-opened pdfplumber object to avoid reparsing the whole PDF
+        toc_chunks = []
+        for p in toc_pages:
+            try:
+                toc_chunks.append(_page_text(p))
+            except Exception:
+                pass
+        toc_text = "\n".join([c for c in toc_chunks if c])
 
         # 目录行通常形如：第三节 管理层讨论与分析........14
         m = re.search(r"第三节\s*管理层讨论与分析[\.·…\s]{2,200}(\d{1,4})", toc_text)
@@ -705,7 +1338,7 @@ class AnnualReportParser:
             # 在候选页附近（向前2页、向后6页）寻找“第三节 管理层讨论与分析”或“03 管理层讨论与分析”标题页
             for p in range(max(start_page - 2, 0), start_page + 7):
                 try:
-                    t = self.extract_text(pdf_path, page_numbers=[p])
+                    t = _page_text(p)
                 except Exception:
                     t = ""
                 if not t:
@@ -726,7 +1359,7 @@ class AnnualReportParser:
             else:
                 # 若落在目录页附近或该页包含“目录”，说明仍是目录区域，强制放弃目录定位
                 try:
-                    check_text = self.extract_text(pdf_path, page_numbers=[start_page])
+                    check_text = _page_text(start_page)
                 except Exception:
                     check_text = ""
                 if check_text and ("目录" in check_text or "目 录" in check_text):
@@ -738,8 +1371,11 @@ class AnnualReportParser:
         # 2) 目录失败：正文扫描定位（前200页逐页找“第三节 管理层讨论与分析”）
         if start_page is None:
             scan_start = (toc_page + 1) if toc_page is not None else 0
-            for p in range(scan_start, 200):
-                page_text = self.extract_text(pdf_path, page_numbers=[p])
+            scan_end = 200
+            if _pdf is not None:
+                scan_end = min(scan_end, len(_pdf.pages))
+            for p in range(scan_start, scan_end):
+                page_text = _page_text(p)
                 if not page_text:
                     continue
                 # 跳过目录页（目录页经常包含“第三节…14”导致误命中）
@@ -752,6 +1388,11 @@ class AnnualReportParser:
         if start_page is None:
             # 非标准年报兜底：没有“第三节 管理层讨论与分析”时，尝试抽取“董事长致辞/董事会报告/业务展望”。
             alt = self.extract_alt_sections(pdf_path)
+            if _pdf is not None:
+                try:
+                    _pdf.close()
+                except Exception:
+                    pass
             if alt:
                 return alt
 
@@ -768,9 +1409,12 @@ class AnnualReportParser:
             r"报告期内公司从事的主要业务",
         ]
         calibrated = None
-        for p in range(start_page, start_page + 12):
+        anchor_end = start_page + 12
+        if _pdf is not None:
+            anchor_end = min(anchor_end, len(_pdf.pages))
+        for p in range(start_page, anchor_end):
             try:
-                t = self.extract_text(pdf_path, page_numbers=[p])
+                t = _page_text(p)
             except Exception:
                 t = ""
             if not t:
@@ -791,8 +1435,11 @@ class AnnualReportParser:
         # - 公司治理（无“第四节”字样）
         # - 直接出现后续章节：十二、报告期内接待调研… / 十三、市值管理… 等
         mda_text = ""
-        for p in range(start_page, start_page + 200):
-            page_text = self.extract_text(pdf_path, page_numbers=[p])
+        max_p = start_page + 200
+        if _pdf is not None:
+            max_p = min(max_p, len(_pdf.pages))
+        for p in range(start_page, max_p):
+            page_text = _page_text(p)
             if not page_text:
                 continue
 
@@ -816,6 +1463,11 @@ class AnnualReportParser:
             mda_text += page_text + "\n"
 
         if not mda_text:
+            if _pdf is not None:
+                try:
+                    _pdf.close()
+                except Exception:
+                    pass
             return None
 
         # 强制裁剪到第三节正文开始：优先“第三节/03 管理层讨论与分析”，否则用稳定正文锚点（避免夹带第二节尾页）。
@@ -926,19 +1578,34 @@ class AnnualReportParser:
         # 校验/兜底
         if management_overview is not None and len(management_overview) < 500:
             management_overview = mda_text.strip() if mda_text else management_overview
-        if future is not None and len(future) < 200:
-            future = None
 
-        # 非标准模板兜底：若第三节里仍未抓到“未来展望/业务展望”，尝试从全文兜底抽取（如“2026年业务展望”）
+
+        # 兜底：第三节里抓不到 future 时，优先从全文抓“未来展望/业务展望/发展规划”（剔除目录/释义等），
+        # 再不行才用 extract_alt_sections（更像“综述+展望”打包）。
         if future is None:
             try:
-                alt = self.extract_alt_sections(pdf_path)
-                if alt and alt.get("future"):
-                    future = alt.get("future")
+                future = self.extract_future_from_fulltext(pdf_path)
             except Exception:
-                pass
+                future = None
+
+            if future is None:
+                try:
+                    alt = self.extract_alt_sections(pdf_path)
+                    if alt and alt.get("future"):
+                        future = alt.get("future")
+                except Exception:
+                    pass
+
+        if future is not None and len(future) < 200:
+            future = None
         industry = None
         business = management_overview
+
+        if _pdf is not None:
+            try:
+                _pdf.close()
+            except Exception:
+                pass
 
         return {
             "industry": industry,
@@ -1192,7 +1859,7 @@ class AnnualReportParser:
             end_candidates: list[int] = []
 
             # A) 下一个点分标题（任意 1~3 级，如 2.3.2 / 2.4 / 3.1）
-            m_dot = re.search(r"(?:^|\n)\s*\d+(?:[\.．]\d+){1,3}\b", tail)
+            m_dot = re.search(r"(?:^|\n)\s*\d+(?:[\.．]\d+){1,3}(?!\d)", tail)
             if m_dot:
                 end_candidates.append(start + 1 + m_dot.start())
 
@@ -1240,6 +1907,11 @@ class AnnualReportParser:
         match = re.search(pattern, text)
         return match.group(0).strip() if match else None
 
+
+from reportlab.platypus import Paragraph, Spacer, HRFlowable, PageBreak
+from reportlab.platypus import Preformatted
+import re
+import xml.sax.saxutils
 
 # ===============================
 # 主逻辑
@@ -1296,10 +1968,19 @@ def main():
 
     base_url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
 
-    end_date = datetime.today()
+    now_dt = datetime.now()
+    # cninfo 的 announcementTime 在不少情况下会被“按天归一化”为当天 00:00（并可能表现为次日 00:00，受时区/入库口径影响）。
+    # 为了避免把“当天晚些时候披露、但时间戳落在次日 00:00”的公告过滤掉：
+    # - seDate 查询上界使用“明天 00:00”
+    # - 真实时间戳过滤上界也放宽到“明天 00:00”（同一天二次增量尤其需要）
+    end_date = now_dt
+    query_end_date = datetime.combine((now_dt + timedelta(days=1)).date(), datetime.min.time())
+
     start_date = end_date - timedelta(days=days_back)
 
     # 若启用增量窗口：start_date 取 max(days_back窗口起点, 上次抓取截止时间)
+    last_end = None
+    same_day_incremental = False
     if use_last_crawl:
         last_end = load_last_crawl_ts(last_crawl_state_file)
         if last_end is not None:
@@ -1308,17 +1989,50 @@ def main():
             if safe_last_end > start_date:
                 start_date = safe_last_end
 
-    start_ts = start_date.timestamp()
-    end_ts = end_date.timestamp()
+            # If last crawl end is today, enable same-day incremental mode (use seen-keys to stop early)
+            if last_end.date() == end_date.date():
+                same_day_incremental = True
 
-    date_range = f"{start_date.strftime('%Y-%m-%d')}~{end_date.strftime('%Y-%m-%d')}"
+    # NOTE: cninfo 的 announcementTime 经常被“按天归一化”（当天全部是 00:00:00）。
+    # 同一天二次/多次增量时，不能用 last_crawl_end_iso(到秒) 作为下界，否则会把“今天”整天过滤掉。
+    # 解决：只要进入 same_day_incremental，就把 start_date 强制归零到“今天 00:00:00”，
+    # 并依赖 last_crawl_seen（已见公告 key）来做到“只抓新增 + 命中已见即早停分页”。
+    if same_day_incremental:
+        start_date = datetime.combine(end_date.date(), datetime.min.time())
+
+    # Load seen announcement keys for same-day incremental
+    state_obj = load_crawl_state_obj(last_crawl_state_file) if use_last_crawl else {}
+    today_key = end_date.strftime("%Y-%m-%d")
+    seen_map = state_obj.get("last_crawl_seen") if isinstance(state_obj.get("last_crawl_seen"), dict) else {}
+    seen_szse = set(seen_map.get("szse") or [])
+    seen_sse = set(seen_map.get("sse") or [])
+
+    if not same_day_incremental:
+        # Different day: reset the seen keys (we don't need them across days)
+        seen_szse.clear()
+        seen_sse.clear()
+
+    start_ts = start_date.timestamp()
+    # 真实过滤上界：放宽到 query_end_date，避免“当日披露但时间戳落在次日 00:00”的公告被过滤掉
+    end_ts = query_end_date.timestamp() + 60
+
+    # cninfo seDate 只认日期；上界用 query_end_date（次日 00:00）确保覆盖“当天披露但被标记到次日 00:00”的公告。
+    date_range = f"{start_date.strftime('%Y-%m-%d')}~{query_end_date.strftime('%Y-%m-%d')}"
     if use_last_crawl:
-        print(f"[crawler] use_last_crawl=true, state={last_crawl_state_file}, window={date_range}")
+        extra = ", same_day_incremental=true" if same_day_incremental else ""
+        print(f"[crawler] use_last_crawl=true, state={last_crawl_state_file}, window={date_range}{extra}")
+
+    # Track latest successfully processed announcement time in this run.
+    # We persist this as last_crawl_end_iso so multiple runs in the same day can pick up newly posted reports.
+    max_processed_dt: datetime | None = None
 
     columns = ["szse", "sse"]  # 全市场：深交所 + 上交所
 
     for col in columns:
         page = 1
+        # Same-day incremental: stop as soon as we hit the first previously-seen announcement (newest-first ordering)
+        seen_set = seen_szse if col == "szse" else seen_sse
+        newly_seen_this_run: list[str] = []
         while True:
             plate = "sz" if col == "szse" else "sh"  # 深市/沪市
             print(f"[{col}] 拉取第 {page} 页...")
@@ -1357,6 +2071,7 @@ def main():
             # 已按 announcementTime desc 排序：当本页最老公告都早于 start_date 时，后续页只会更早，直接停止。
             oldest_ts = None
             newest_ts = None
+            ts_count = 0
             for a in announcements:
                 t = a.get("announcementTime")
                 ts = None
@@ -1375,18 +2090,27 @@ def main():
                             ts = None
                 if ts is None:
                     continue
+                ts_count += 1
                 oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
                 newest_ts = ts if newest_ts is None else max(newest_ts, ts)
 
-            if oldest_ts is not None and oldest_ts < start_ts:
-                print(f"[{col}] 已到达时间窗口下界（本页最老 {datetime.fromtimestamp(oldest_ts).strftime('%Y-%m-%d')} < {start_date.strftime('%Y-%m-%d')}），处理完本页后停止分页。")
+            # 用完整时间打印，避免同一天但不同时间造成误解
+            start_dt_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
+
+            if ts_count > 0 and oldest_ts is not None and oldest_ts < start_ts:
+                print(
+                    f"[{col}] 已到达时间窗口下界（本页最老 {datetime.fromtimestamp(oldest_ts).strftime('%Y-%m-%d %H:%M:%S')} < {start_dt_str}），处理完本页后停止分页。"
+                )
                 stop_after_page = True
             else:
                 stop_after_page = False
 
-            # 如果本页最新也早于窗口下界，说明全页都过期，直接停止（无需再处理/翻页）
-            if newest_ts is not None and newest_ts < start_ts:
-                print(f"[{col}] 本页最新也早于时间窗口（{datetime.fromtimestamp(newest_ts).strftime('%Y-%m-%d')} < {start_date.strftime('%Y-%m-%d')}），立即停止分页。")
+            # 如果本页最新也早于窗口下界，说明全页都过期
+            # 只有在我们成功解析到了 announcementTime（ts_count>0）时才启用这个快速停止，避免解析失败导致误判。
+            if ts_count > 0 and newest_ts is not None and newest_ts < start_ts:
+                print(
+                    f"[{col}] 本页最新也早于时间窗口（{datetime.fromtimestamp(newest_ts).strftime('%Y-%m-%d %H:%M:%S')} < {start_dt_str}），立即停止分页。"
+                )
                 break
 
             if page >= 50:
@@ -1404,6 +2128,12 @@ def main():
             for ann in announcements:
 
                 title = ann["announcementTitle"]
+
+                ann_key = build_announcement_key(col, ann)
+                if same_day_incremental and ann_key in seen_set:
+                    # 同一天二次/多次增量：只跳过已处理公告，不要直接 break。
+                    # 实测同一页内的排序并不总是严格“新->旧”，直接 break 可能错过同页后面的新公告。
+                    continue
 
                 # 过滤：必须是年度报告（排除摘要）
                 if "年度报告" not in title:
@@ -1454,6 +2184,11 @@ def main():
                         continue
                     if pd < start_ts or pd > end_ts:
                         continue
+
+                # Update run checkpoint candidate (only if we have a real timestamp)
+                if isinstance(publish_dt, datetime):
+                    if max_processed_dt is None or publish_dt > max_processed_dt:
+                        max_processed_dt = publish_dt
 
                 # 去重/重试策略：
                 # - 若该公司该年已存在且解析完整，则跳过（仅当 reparse_existing=False）
@@ -1534,22 +2269,70 @@ def main():
                     db.insert_mda(report_id, mda)
                     print(f"完成：{stock_code}-{year} ({col})")
 
+                # mark this announcement as seen for same-day incremental
+                if use_last_crawl:
+                    if ann_key not in seen_set:
+                        seen_set.add(ann_key)
+                        newly_seen_this_run.append(ann_key)
+
                 processed_this_page += 1
+
+            # same-day incremental：若这一页完全没有新增可处理年报，则不再翻页（避免扫全日）
+            if same_day_incremental and processed_this_page == 0:
+                print(f"[{col}] same-day incremental: 本页无新增可处理年报，停止分页。")
+                break
 
             if processed_this_page == 0 and page >= 3:
                 print(f"[{col}] 连续分页未处理到任何有效年报（processed=0），停止分页以防异常无限翻页。")
-                break
-
-            if stop_after_page:
                 break
             page += 1
             time.sleep(1.5)
 
     # 写入本次抓取的截止时间（用于下次增量）
+    # Persist the latest processed announcement time instead of the script run time.
+    # This allows multiple runs in the same day to pick up newly posted reports.
     if use_last_crawl:
-        save_last_crawl_ts(last_crawl_state_file, end_date)
+        # update crawl end iso (time-based checkpoint)
+        if max_processed_dt is not None:
+            save_last_crawl_ts(last_crawl_state_file, max_processed_dt)
+
+        # update same-day seen keys checkpoint
+        state_obj = load_crawl_state_obj(last_crawl_state_file)
+        state_obj["last_crawl_day"] = end_date.strftime("%Y-%m-%d")
+
+        # cap seen list to keep the state file small
+        def _cap(lst: list[str], cap_n: int = 3000) -> list[str]:
+            if len(lst) <= cap_n:
+                return lst
+            return lst[-cap_n:]
+
+        state_obj["last_crawl_seen"] = {
+            "szse": _cap(list(seen_szse)),
+            "sse": _cap(list(seen_sse)),
+        }
+        save_crawl_state_obj(last_crawl_state_file, state_obj)
     print("增量更新完成")
 
 
 if __name__ == "__main__":
     main()
+def safe_block(text, body_style):
+    """
+    Build a reportlab flowable for section text, preserving line breaks for multi-line content.
+    """
+    from xml.sax.saxutils import escape
+    # Make table placeholder always appear as its own paragraph
+    ph = "[表格/图表内容已省略，详见原文PDF]"
+    if text:
+        if ph in text:
+            # Ensure placeholder has blank lines around it
+            text = re.sub(rf"\s*{re.escape(ph)}\s*", f"\n\n{ph}\n\n", text)
+    if not text:
+        return Paragraph("（未提取到内容）", body_style)
+    if "\n" in text or ph in text:
+        # Escape but keep newlines; Preformatted preserves them
+        safe = escape(text)
+        return Preformatted(safe, body_style)
+    else:
+        safe = escape(text)
+        return Paragraph(safe, body_style)

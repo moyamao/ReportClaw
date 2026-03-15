@@ -127,14 +127,11 @@ def _build_http_with_proxy(timeout_sec: int = 25) -> httplib2.Http:
 DEFAULT_HEADER = [
     # --- program fields ---
     "key",
-    "stock_code",
     "stock_name",
-    "report_year",
     "publish_date",
     "pdf_name",
     # --- manual fields (do NOT overwrite) ---
     "score",
-    "tags",
     "notes",
 ]
 
@@ -417,14 +414,11 @@ def _sync_rows_to_worksheet(
 
         row_values = [
             key,
-            str(r.get("stock_code", "") or ""),
             str(r.get("stock_name", "") or ""),
-            int(r.get("report_year")) if str(r.get("report_year", "")).isdigit() else str(r.get("report_year", "") or ""),
             publish_date,
             pdf_name,
-            "",
-            "",
-            "",
+            "",  # score (manual)
+            "",  # notes (manual)
         ]
 
         if key in key_to_row:
@@ -433,7 +427,7 @@ def _sync_rows_to_worksheet(
             appends.append(row_values)
 
     if updates:
-        _batch_update_rows_A_to_F(sheets, spreadsheet_id, worksheet, updates)
+        _batch_update_rows_A_to_D(sheets, spreadsheet_id, worksheet, updates)
     if appends:
         _append_rows(sheets, spreadsheet_id, worksheet, appends)
 
@@ -743,12 +737,71 @@ def _ensure_worksheet_and_header(
         print(f"[sheets] 创建 worksheet: {worksheet}")
 
     # Check header row
-    rng = f"{worksheet}!A1:I1"
+    rng = f"{worksheet}!A1:F1"
     values = sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute().get("values", [])
 
-    # --- schema migration: old header without publish_date ---
+    # --- schema migration: shrink columns (drop stock_code, report_year, tags) ---
+    # Old (9 cols): key, stock_code, stock_name, report_year, publish_date, pdf_name, score, tags, notes
+    # New (6 cols): key, stock_name, publish_date, pdf_name, score, notes
+    if values and values[0]:
+        old = values[0]
+        if old[:9] == [
+            "key",
+            "stock_code",
+            "stock_name",
+            "report_year",
+            "publish_date",
+            "pdf_name",
+            "score",
+            "tags",
+            "notes",
+        ]:
+            # Delete columns in descending index order to avoid shifting:
+            # H(tags) idx=7, D(report_year) idx=3, B(stock_code) idx=1 (0-based)
+            req = {
+                "requests": [
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 7,
+                                "endIndex": 8,
+                            }
+                        }
+                    },
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 3,
+                                "endIndex": 4,
+                            }
+                        }
+                    },
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 1,
+                                "endIndex": 2,
+                            }
+                        }
+                    },
+                ]
+            }
+            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
+            print("[sheets] schema migration: removed columns stock_code/report_year/tags")
+            # Re-read header after deleting columns
+            values = sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=rng
+            ).execute().get("values", [])
+
+    # --- schema migration: old header without publish_date (legacy) ---
     # Old (8 cols): key, stock_code, stock_name, report_year, pdf_name, score, tags, notes
-    # New (9 cols): key, stock_code, stock_name, report_year, publish_date, pdf_name, score, tags, notes
+    # We first insert publish_date at E, then apply the shrink migration above on next run.
     if values and values[0]:
         old = values[0]
         if (
@@ -757,7 +810,6 @@ def _ensure_worksheet_and_header(
             and old[4] == "pdf_name"
             and ("publish_date" not in old)
         ):
-            # Insert 1 column at index 4 (0-based) => column E, shifting pdf_name and manual cols to the right.
             req = {
                 "requests": [
                     {
@@ -775,8 +827,9 @@ def _ensure_worksheet_and_header(
             }
             sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
             print("[sheets] schema migration: inserted publish_date column (E)")
-            # Re-read header after inserting the column
-            values = sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute().get("values", [])
+            values = sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=rng
+            ).execute().get("values", [])
 
     if not values or values[0][: len(header)] != header:
         body = {"values": [header]}
@@ -811,17 +864,17 @@ def _read_existing_key_map(sheets, spreadsheet_id: str, worksheet: str) -> Dict[
 
 
 
-def _batch_update_rows_A_to_F(
+def _batch_update_rows_A_to_D(
     sheets, spreadsheet_id: str, worksheet: str, updates: List[Tuple[int, List[Any]]]
 ) -> None:
     """
-    Update only columns A:F (program columns), leaving manual columns G:I untouched.
+    Update only columns A:D (program columns), leaving manual columns E:F untouched.
     """
     data = []
     for row_idx, row_values in updates:
-        # A:F are first 6 columns
-        vals = row_values[:6]
-        rng = f"{worksheet}!A{row_idx}:F{row_idx}"
+        # A:D are first 4 columns
+        vals = row_values[:4]
+        rng = f"{worksheet}!A{row_idx}:D{row_idx}"
         data.append({"range": rng, "values": [vals]})
 
     body = {"valueInputOption": "RAW", "data": data}
