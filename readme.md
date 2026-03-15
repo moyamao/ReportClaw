@@ -1,4 +1,8 @@
-# 配置文件
+# 功能描述
+- 抓取A股年报，截取最关键的管理层综述和未来展望部分，存入数据库。
+- 生成pdf，发送到邮箱。
+
+## 配置文件
 
 - 初始化，设置数据库，邮件网关等
 ```
@@ -6,9 +10,13 @@ cp conf/config.example.ini conf/config.ini
 
 修改： conf/config.ini
 ```
+- 前置资源
+  - 本地mysql数据库
+  - google sheet的权限文件，和同步的表格
+  - 发送邮件的smtp地址和用户
 
 
-# 常用命令
+## 常用命令
 - 抓取数据
 ```
 cd /Users/mhy/python/ReportClaw
@@ -29,7 +37,7 @@ PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report
 ./data/state/last_sent.json
 ```
 
-# 常用sql
+## 常用sql
 
 - 删除某个公司某年的财报
 ```
