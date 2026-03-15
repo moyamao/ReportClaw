@@ -1,20 +1,34 @@
 # 配置文件
+
+- 初始化，设置数据库，邮件网关等
 ```
 cp conf/config.example.ini conf/config.ini
+
+修改： conf/config.ini
 ```
-- edit conf/config.ini
 
 
 # 常用命令
+- 抓取数据
+```
+cd /Users/mhy/python/ReportClaw
+./venv/bin/python -m reportclaw.main
+```
+
 -  使用代理生成pdf，发邮件，生成google sheet
+```
 export HTTPS_PROXY=http://127.0.0.1:1092
 export HTTP_PROXY=http://127.0.0.1:1092
 export https_proxy=http://127.0.0.1:1092
 export http_proxy=http://127.0.0.1:1092
 cd /Users/mhy/python/ReportClaw
 PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report
+```
+-  默认抓取最近三十天A股数据，重复抓取需要修改状态文件 
+```
+./data/state/last_sent.json
+```
 
-   
 # 常用sql
 
 - 删除某个公司某年的财报
