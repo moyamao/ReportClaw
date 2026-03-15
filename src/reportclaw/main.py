@@ -497,7 +497,153 @@ class AnnualReportParser:
 
         # Also collapse accidental double-sentence repetition inside the same line: “回升。回升。”
         out = re.sub(r"([\u4e00-\u9fff]{1,6}[。；！？])\s*\1", r"\1", out)
+        # Merge soft-wrapped newlines (keep paragraphs/lists/headings)
+        out = self._unwrap_soft_linebreaks(out)
         return out
+
+    def _unwrap_soft_linebreaks(self, text: str) -> str:
+        """
+        Merge PDF soft-wrapped line breaks back into a single paragraph line,
+        while preserving true paragraph breaks and headings/list structure.
+
+        Key fix:
+        - Some PDFs insert a SINGLE blank line inside a wrapped paragraph/list item.
+          We treat a single blank line as a *soft* break when the surrounding
+          lines clearly belong to the same paragraph, and only treat 2+ blank
+          lines as a real paragraph separator.
+
+        Rules:
+        - Keep 2+ consecutive blank lines as paragraph separators.
+        - Do NOT merge across headings / list-item starts.
+        - Merge when the previous line looks like it continues (doesn't end with strong terminal punctuation),
+          OR ends with comma-like punctuation (，、：；, etc. treated as "continue" by default).
+        """
+        if not text:
+            return ""
+
+        t = text.replace("\r\n", "\n").replace("\r", "\n")
+        # keep paragraph breaks, but collapse 3+ newlines into a single blank line
+        t = re.sub(r"\n{3,}", "\n\n", t)
+
+        lines = t.split("\n")
+
+        # Heading / list starts: never merge a previous line into these
+        heading_or_list_re = re.compile(
+            r"^\s*(?:"
+            r"第[一二三四五六七八九十]{1,3}[章节]|"  # 第三章/节
+            r"\d+(?:[\.．]\d+){1,3}\b|"          # 2.3 / 2.3.1 / 10.2.3 (dot headings)
+            r"[一二三四五六七八九十]{1,3}[、\.．:：]|"  # 三、 / 三. / 三：
+            r"\d{1,2}[、\.．:：]|"  # 3、 / 3. / 3：
+            r"[（(][一二三四五六七八九十0-9]{1,3}[）)]|"  # （三） / (3)
+            r"[-•●]\s+"  # - / • bullet
+            r")"
+        )
+
+        # Strong terminal punctuation: if a line ends with these, treat as paragraph end (do not merge)
+        strong_end_re = re.compile(r"[。！？!?]\s*$")
+
+        out: list[str] = []
+        buf = ""
+
+        def flush_buf():
+            nonlocal buf
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ""
+
+        i = 0
+        n = len(lines)
+        while i < n:
+            raw = lines[i]
+            s = (raw or "").strip()
+
+            # --- handle blank lines ---
+            if not s:
+                # count consecutive blanks
+                j = i
+                while j < n and not (lines[j] or "").strip():
+                    j += 1
+                blank_cnt = j - i
+
+                # Lookahead to next non-empty line
+                nxt = (lines[j] or "").strip() if j < n else ""
+
+                if blank_cnt >= 2:
+                    # Real paragraph break
+                    flush_buf()
+                    out.append("")
+                else:
+                    # Single blank line: treat as soft break IF it looks like the same paragraph continues
+                    prev = buf.rstrip()
+                    can_soft_merge = False
+                    if prev and nxt:
+                        if (not strong_end_re.search(prev)) and (not heading_or_list_re.match(nxt)):
+                            # also avoid soft-merge when the previous line is very short (often a heading-ish fragment)
+                            if len(prev) > 6:
+                                can_soft_merge = True
+                    if can_soft_merge:
+                        # keep in same paragraph; insert one space so words don't glue
+                        if not prev.endswith(" "):
+                            buf = prev + " "
+                    else:
+                        flush_buf()
+                        out.append("")
+
+                i = j
+                continue
+
+            # --- non-blank line ---
+            if not buf:
+                buf = s
+                i += 1
+                continue
+
+            # If current line is a heading/list start, keep a hard break before it
+            if heading_or_list_re.match(s):
+                flush_buf()
+                buf = s
+                i += 1
+                continue
+
+            prev = buf.rstrip()
+
+            # 1) If prev already ends with strong terminal punctuation, do not merge
+            if strong_end_re.search(prev):
+                flush_buf()
+                buf = s
+                i += 1
+                continue
+
+            # 2) If prev ends with obvious "still continuing" punctuation, merge
+            if re.search(r"[，,、：:（(\-]\s*$", prev):
+                joiner = ""
+                # add space only when both sides are ASCII-ish words/numbers
+                if re.search(r"[A-Za-z0-9]$", prev) and re.match(r"^[A-Za-z0-9]", s):
+                    joiner = " "
+                buf = prev + joiner + s
+                i += 1
+                continue
+
+            # 3) If prev line is short, prefer NOT to merge
+            if len(prev) <= 6:
+                flush_buf()
+                buf = s
+                i += 1
+                continue
+
+            # 4) Default: merge
+            joiner = ""
+            if re.search(r"[A-Za-z0-9]$", prev) and re.match(r"^[A-Za-z0-9]", s):
+                joiner = " "
+            buf = prev + joiner + s
+            i += 1
+
+        flush_buf()
+
+        rebuilt = "\n".join(out)
+        rebuilt = re.sub(r"\n{3,}", "\n\n", rebuilt).strip()
+        return rebuilt
+
     MAJOR_HEADING_KEYWORDS = [
         "核心竞争力", "核心竞争力分析",
         "主营业务分析", "主营业务",
@@ -952,7 +1098,7 @@ class AnnualReportParser:
 
         # Strong stop headings: if extracted section leaks into these chapters, cut immediately.
         end_title_keywords = [
-            "可能面对的风险", "风险因素", "风险提示", "风险",
+            "可能面对的风险", "风险因素", "风险提示", "经营风险",
             "公司治理", "重要事项", "投资者关系", "市值管理",
             "财务报告", "财务会计报告", "备查文件",
             "报告期内接待调研", "接待调研", "调研、沟通、采访",
@@ -1225,6 +1371,23 @@ class AnnualReportParser:
             # 1.1) 形如 14/248 的页码
             if re.fullmatch(r"\d{1,4}\s*/\s*\d{1,4}", line):
                 continue
+            # 1.1.5) 纯页码行兜底：可能夹杂不可见字符（肉眼看是 14，但 fullmatch 不命中）
+            _digits_only = re.sub(r"\D", "", line)
+            if _digits_only and len(_digits_only) <= 4:
+                _non_space = re.sub(r"\s", "", line)
+                _non_space2 = re.sub(r"[\[\]（）()<>《》]", "", _non_space)
+                if _non_space2 == _digits_only:
+                    continue
+            # 1.6) 行尾页码（例如标题末尾带 "... 14"），更强兜底：允许夹杂不可见字符
+            #     目标：移除页眉/页脚页码，不影响年份(2025/2026等)
+            m_tail_page = re.match(r"^(.*?)(?:\s+)(\d{1,4})\s*$", line)
+            if m_tail_page:
+                left = m_tail_page.group(1).strip()
+                tail_num_raw = m_tail_page.group(2)
+                tail_num = re.sub(r"\D", "", tail_num_raw)
+                # 只剥离 1~3 位短数字，避免误伤年份
+                if tail_num and len(tail_num) <= 3 and left and not re.search(r"(19|20)\d{2}$", left):
+                    line = left
             # 1.2) 常见页眉（公司名 + 年度报告）
             if ("年度报告" in line) and ("股份有限公司" in line):
                 continue
@@ -1284,6 +1447,8 @@ class AnnualReportParser:
         # Collapse duplicated short sentence inside the same line: “回升。回升。”
         text = re.sub(r"([\u4e00-\u9fff]{1,6}[。；！？])\s*\1", r"\1", text)
 
+        # Merge soft-wrapped newlines (keep paragraphs/lists/headings)
+        text = self._unwrap_soft_linebreaks(text)
         return text
 
     def extract_mda(self, pdf_path):
@@ -1518,46 +1683,59 @@ class AnnualReportParser:
         if m_core and m_core.start() > 0:
             management_overview = mda_text[:m_core.start()].strip()
 
-        # 未来展望/发展规划：不同年报模板标题差异很大
-        # 常见：十一、公司未来发展的展望 / 公司关于公司未来发展的讨论与分析 / 未来发展战略 / 发展规划
-        future = self.extract_section_by_keywords(
-            mda_text,
-            keywords=[
-                "2026年业务展望",
-                "业务展望",
-                "公司未来发展的展望",
-                "未来发展的展望",
-                "未来发展展望",
-                "公司关于公司未来发展的讨论与分析",
-                "公司关于未来发展的讨论与分析",
-                "关于公司未来发展的讨论与分析",
-                "未来发展战略",
-                "未来发展规划",
-                "发展规划",
-                "未来规划",
-            ],
-            fallback_ordinals=None,
-            # 未来展望结束边界：只在遇到这些“后续大章”标题时才结束，避免被正文里的“二、三、…”条目误截断
-            end_title_keywords=[
-                "可能面对的风险",
-                "风险",
-                "公司治理",
-                "重要事项",
-                "股份变动",
-                "股东情况",
-                "董事",
-                "监事",
-                "高级管理人员",
-                "员工情况",
-                "融资",
-                "利润分配",
-                "财务会计报告",
-                "财务报告",
-                "备查文件",
-                "报告期内接待调研",
-                "市值管理",
-            ],
-        )
+        # 未来展望提取优先级（按你的规则）：
+        # 1) 先从“全文的十一章/未来发展的展望”提取（最权威、最完整）
+        # 2) 若取不到，再从第三节（管理层讨论与分析）里按关键词兜底
+        future = None
+
+        # (1) 先从全文提取（通常是：十一、公司未来发展的展望）
+        try:
+            future = self.extract_future_from_fulltext(pdf_path)
+        except Exception:
+            future = None
+
+        # (2) 全文没取到，再从第三节里兜底
+        if future is None:
+            future = self.extract_section_by_keywords(
+                mda_text,
+                keywords=[
+                    "2026年业务展望",
+                    "业务展望",
+                    "公司未来发展的展望",
+                    "未来发展的展望",
+                    "未来发展展望",
+                    "公司关于公司未来发展的讨论与分析",
+                    "公司关于未来发展的讨论与分析",
+                    "关于公司未来发展的讨论与分析",
+                    "未来发展战略",
+                    "未来发展规划",
+                    "发展规划",
+                    "未来规划",
+                ],
+                fallback_ordinals=None,
+                # 未来展望结束边界：只在遇到这些“后续大章”标题时才结束，避免被正文里的“二、三、…”条目误截断
+                end_title_keywords=[
+                    "可能面对的风险",
+                    "风险因素",
+                    "风险提示",
+                    "经营风险",
+                    "公司治理",
+                    "重要事项",
+                    "股份变动",
+                    "股东情况",
+                    "董事",
+                    "监事",
+                    "高级管理人员",
+                    "员工情况",
+                    "融资",
+                    "利润分配",
+                    "财务会计报告",
+                    "财务报告",
+                    "备查文件",
+                    "报告期内接待调研",
+                    "市值管理",
+                ],
+            )
 
         # Safety trim: do not leak later non-MDA chapters into future section.
         # 一些年报会在后续出现“十二、报告期内接待调研…”、“十三、市值管理…”等章节，必须截断。
@@ -1580,21 +1758,15 @@ class AnnualReportParser:
             management_overview = mda_text.strip() if mda_text else management_overview
 
 
-        # 兜底：第三节里抓不到 future 时，优先从全文抓“未来展望/业务展望/发展规划”（剔除目录/释义等），
-        # 再不行才用 extract_alt_sections（更像“综述+展望”打包）。
+
+        # 最后兜底：全文也抓不到时，才用 alt_sections（更像“综述+展望”打包）
         if future is None:
             try:
-                future = self.extract_future_from_fulltext(pdf_path)
+                alt = self.extract_alt_sections(pdf_path)
+                if alt and alt.get("future"):
+                    future = alt.get("future")
             except Exception:
-                future = None
-
-            if future is None:
-                try:
-                    alt = self.extract_alt_sections(pdf_path)
-                    if alt and alt.get("future"):
-                        future = alt.get("future")
-                except Exception:
-                    pass
+                pass
 
         if future is not None and len(future) < 200:
             future = None
@@ -1620,11 +1792,47 @@ class AnnualReportParser:
         同时支持：
         - 一级标题：二、xxx / 2、xxx
         - 括号小标题：（三）xxx / (3)xxx
+
+        规则增强：
+        - “风险/可能面对的风险”可以作为结束词，但如果命中的标题行很短（基本是一行标题），
+          则把该标题行也包含进返回内容里作为结尾（不包含其后正文），避免把结尾信息截掉。
         """
         if start_idx is None or start_idx < 0:
             return None
 
+        def _line_bounds(pos: int) -> tuple[int, int]:
+            """Return [line_start, line_end) bounds around pos in text."""
+            ls = text.rfind("\n", 0, pos)
+            le = text.find("\n", pos)
+            line_start = ls + 1 if ls >= 0 else 0
+            line_end = le if le >= 0 else len(text)
+            return line_start, line_end
+
         candidates = []
+
+        # 风险类作为结束标题：只在“标题行”层面触发（不会因为正文里出现“风险”而误截断）。
+        # 同时兼容不同表述：例如“公司面临的风险和应对措施 / 风险因素 / 风险提示 / 经营风险”等。
+        def _risk_end_enabled() -> bool:
+            if not title_keywords:
+                return False
+            # 只要调用方在 end_title_keywords 中显式放了“风险类”关键词，就认为允许用风险章作为结束边界
+            enabled_keys = [
+                "可能面对的风险", "公司面临的风险", "风险因素", "风险提示", "经营风险",
+                "风险及应对", "风险和应对", "应对措施", "风险应对"
+            ]
+            return any(any((k in kw) or (kw in k) for kw in title_keywords) for k in enabled_keys)
+
+        def _is_risk_heading_line(title_line: str) -> bool:
+            tl = (title_line or "").strip()
+            if not tl:
+                return False
+            # 必须是标题行（由外层正则定位到 end_idx），这里只做标题文本匹配
+            if "风险" not in tl:
+                return False
+            # 避免把“强化风险管控/风险管理”等正文用语当成章节标题：要求同时包含“因素/提示/应对/措施/面临”等之一
+            if re.search(r"(因素|提示|应对|措施|面临)", tl):
+                return True
+            return False
 
         # A) 一级标题：二、xxx
         for m in re.finditer(
@@ -1632,7 +1840,12 @@ class AnnualReportParser:
             text[start_idx + 1:]
         ):
             title = m.group(2)
-            if any(kw in title for kw in title_keywords):
+            hit = any(kw in title for kw in title_keywords)
+            # 风险类标题的同义/变体：当调用方允许风险作为结束边界时，标题包含“风险”且包含“因素/提示/应对/措施/面临”也算命中
+            if (not hit) and title_keywords:
+                if _risk_end_enabled() and ("风险" in title) and re.search(r"(因素|提示|应对|措施|面临)", title):
+                    hit = True
+            if hit:
                 candidates.append(start_idx + 1 + m.start())
                 break
 
@@ -1642,7 +1855,12 @@ class AnnualReportParser:
             text[start_idx + 1:]
         ):
             title = m.group(1)
-            if any(kw in title for kw in title_keywords):
+            hit = any(kw in title for kw in title_keywords)
+            # 风险类标题的同义/变体：当调用方允许风险作为结束边界时，标题包含“风险”且包含“因素/提示/应对/措施/面临”也算命中
+            if (not hit) and title_keywords:
+                if _risk_end_enabled() and ("风险" in title) and re.search(r"(因素|提示|应对|措施|面临)", title):
+                    hit = True
+            if hit:
                 candidates.append(start_idx + 1 + m.start())
                 break
 
@@ -1650,6 +1868,13 @@ class AnnualReportParser:
             return None
 
         end_idx = min(candidates)
+
+        line_start, line_end = _line_bounds(end_idx)
+        end_line = text[line_start:line_end].strip()
+        # 如果当前命中的结束标题行是风险类标题，则直接在标题起点截断（不包含该标题行及其后正文）。
+        if _risk_end_enabled() and _is_risk_heading_line(end_line):
+            return text[start_idx:end_idx].strip()
+
         return text[start_idx:end_idx].strip()
 
     def _slice_to_next_major_heading(self, text, start_idx):
