@@ -235,7 +235,7 @@ def fetch_rows_by_publish_date(conn, publish_date: str):
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE r.publish_date = %s
-        ORDER BY r.stock_code
+        ORDER BY r.stock_code ASC
         """,
         (publish_date,),
     )
@@ -257,7 +257,7 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE r.publish_date >= %s AND r.publish_date <= %s
-        ORDER BY r.publish_date, r.stock_code
+        ORDER BY r.publish_date DESC, r.stock_code ASC
         """,
         (start_date, end_date),
     )
@@ -279,7 +279,7 @@ def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE m.created_at > %s AND m.created_at <= %s
-        ORDER BY m.created_at ASC, r.stock_code ASC
+        ORDER BY m.created_at DESC, r.stock_code ASC
         """,
         (start_ts, end_ts),
     )
