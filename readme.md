@@ -17,14 +17,11 @@ cp conf/config.example.ini conf/config.ini
 
 
 ## 常用命令
-- 抓取数据
+- 抓取数据，使用代理生成pdf，发邮件，生成google sheet
 ```
 cd /Users/mhy/python/ReportClaw
-./venv/bin/python -m reportclaw.main
-```
+PYTHONPATH=src ./venv/bin/python -m reportclaw.main
 
--  使用代理生成pdf，发邮件，生成google sheet
-```
 export HTTPS_PROXY=http://127.0.0.1:1092
 export HTTP_PROXY=http://127.0.0.1:1092
 export https_proxy=http://127.0.0.1:1092

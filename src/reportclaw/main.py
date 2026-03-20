@@ -552,20 +552,82 @@ class AnnualReportParser:
     def build_fallback_mda(self, pdf_path: str, reason: str, page_count: int) -> dict:
         """Fallback payload for DB so the report is not ignored even if MDA parsing fails.
 
-        We store a sentinel prefix so later runs can retry and overwrite this placeholder.
+        IMPORTANT:
+        - Do NOT dump front-matter (重要提示/目录/释义) into summaries.
+        - If parsing fails, prefer telling the user to read the original PDF.
         """
-        # Keep it reasonably bounded to avoid huge DB rows.
-        head_pages = list(range(0, min(25, max(int(page_count or 0), 1))))
-        head_text = ""
+        excerpt = ""
         try:
-            head_text = self.extract_text(pdf_path, page_numbers=head_pages)
-        except Exception:
-            head_text = ""
+            probe_pages = list(range(0, min(40, max(int(page_count or 0), 1))))
+            probe = self.extract_text(pdf_path, page_numbers=probe_pages) or ""
+            t = probe
 
-        full = f"[PARSE_FAILED] reason={reason}\n" + (head_text or "")
+            # drop blocks helper
+            def _drop_block(src: str, start_pat: str, end_pats: list[str]) -> str:
+                blk = self._extract_between_markers(src, start_pat, end_pats)
+                return src.replace(blk, "") if blk else src
+
+            # remove “重要提示/目录/释义/词汇表”
+            t = _drop_block(
+                t,
+                r"(?:^|\n)重\s*要\s*提\s*示\b",
+                [
+                    r"(?:^|\n)目\s*录\b",
+                    r"(?:^|\n)释\s*义\b",
+                    r"(?:^|\n)词\s*汇\s*表\b",
+                    r"(?:^|\n)第[一二三四五六七八九十]+章\b",
+                    r"(?:^|\n)第一[章节]\b",
+                    r"(?:^|\n)第二[章节]\b",
+                    r"(?:^|\n)第三[章节]\b",
+                ],
+            )
+            t = _drop_block(t, r"(?:^|\n)目\s*录\b", [r"(?:^|\n)第一[章节]\b", r"(?:^|\n)第一节\b"])
+            t = _drop_block(t, r"(?:^|\n)释\s*义\b", [r"(?:^|\n)(?:词\s*汇\s*表|第一[章节]|第一节)\b"])
+            t = _drop_block(t, r"(?:^|\n)词\s*汇\s*表\b", [r"(?:^|\n)(?:第一[章节]|第一节)\b"])
+
+            # try to find a real-content anchor
+            anchors = [
+                r"(?:^|\n)第三章\b",
+                r"(?:^|\n)第三节\s*管理层讨论与分析\b",
+                r"(?:^|\n)第一节\s*公司业务概要\b",
+                r"(?:^|\n)(?:董事会报告|董事会工作报告|董事会报告书)\b",
+                r"(?:^|\n)管理层综述\b",
+            ]
+            cut = None
+            for ap in anchors:
+                m = re.search(ap, t)
+                if m:
+                    cut = m.start()
+                    break
+            if cut is not None:
+                t = t[cut:].strip()
+
+            # if still looks like front-matter, abandon
+            if re.match(r"^(重\s*要\s*提\s*示|目\s*录|释\s*义|词\s*汇\s*表)\b", t):
+                t = ""
+
+            if t and len(t) >= 300:
+                excerpt = t[:6000].rstrip()
+
+        except Exception:
+            excerpt = ""
+
+        pdf_name = os.path.basename(pdf_path)
+        base = f"[PARSE_FAILED] reason={reason} pages={page_count}\n请查看原PDF：{pdf_name}"
+
+        # If we managed to get any real-content excerpt, surface it in `business`
+        # so the daily report doesn't look empty. If we have no excerpt, keep it None.
+        biz = None
+        if excerpt:
+            biz = "（解析失败：以下为正文片段，可能不完整；建议打开原PDF核对）\n\n" + excerpt
+
+        full = base
+        if biz:
+            full = base + "\n\n" + biz
+
         return {
             "industry": None,
-            "business": None,
+            "business": biz,
             "future": None,
             "full_mda": full,
         }
@@ -647,96 +709,117 @@ class AnnualReportParser:
 
     def extract_mda(self, pdf_path):
 
-        # 1) 目录定位：先在前20页里寻找“目录”所在页，再只在目录附近提取第三节页码
+        # 1) 直接正文扫描定位：不要依赖目录页码（目录/重要提示/释义常导致误判）
+        # 目标：找到“管理层讨论与分析/经营情况讨论与分析”的真实正文起点页。
         start_page = None
-        toc_page = None
-        for p in range(0, 20):
-            t = self.extract_text(pdf_path, page_numbers=[p])
-            if t and ("目录" in t or "目 录" in t):
-                toc_page = p
+
+        # 经验：多数年报前 6 页为“重要提示/目录/释义”等前置信息，默认跳过。
+        front_matter_max_pages = 5
+
+        def _is_front_matter_page(t: str, page_index: int | None = None) -> bool:
+            if not t:
+                return True
+
+            # 1) 前 6 页：无条件视为前置页（只用于 start_page 探测阶段的跳过）
+            if page_index is not None and page_index <= front_matter_max_pages:
+                return True
+
+            # 2) 6 页之后：只过滤“目录/释义/词汇表/名词解释/备查文件目录”等清单型内容（强信号）
+            if re.search(r"(目\s*录|释\s*义|词\s*汇\s*表|名词解释|备查文件目录)", t):
+                return True
+
+            # 3) 目录页特征：大量点线 + 页码（强信号）
+            dot_lines = len(re.findall(r"[\.·…]{6,}.*\d{1,4}\s*$", t, flags=re.MULTILINE))
+            if dot_lines >= 3:
+                return True
+
+            # 4) 清单密集：第X章/节/部分密集出现（一般就是目录页）
+            toc_items = len(re.findall(r"第\s*(?:[一二三四五六七八九十]{1,3}|\d{1,2})\s*(?:节|章|部分)", t))
+            if toc_items >= 8:
+                return True
+
+            return False
+
+        def _looks_like_mda_heading(t: str) -> bool:
+            if not t:
+                return False
+
+            bad_words = ("详见", "敬请", "查阅", "参阅", "阅读", "提示")
+            kw = ("管理层讨论与分析", "经营情况讨论与分析")
+
+            for ln in t.split("\n"):
+                s = (ln or "").strip()
+                if not s:
+                    continue
+
+                # 引用句排雷：出现“详见/敬请查阅”等 + 关键词，直接否
+                if any(w in s for w in bad_words) and any(k in s for k in kw):
+                    continue
+
+                # 引号/书名号排雷：大概率是“详见第三节…”那类引用
+                if any(q in s for q in ('“', '”', '"', "'", '《', '》')) and any(k in s for k in kw):
+                    # 但允许纯标题（很短）
+                    if len(re.sub(r"\s+", "", s)) > 20:
+                        continue
+
+                s2 = re.sub(r"\s+", "", s)
+                if len(s2) > 60:
+                    continue
+
+                # 只要是“标题式短行”包含关键词就接受
+                if any(k in s2 for k in kw):
+                    return True
+
+            return False
+
+        # 先粗扫：找标题页
+        for p in range(front_matter_max_pages + 1, 220):
+            try:
+                page_text = self.extract_text(pdf_path, page_numbers=[p])
+            except Exception:
+                page_text = ""
+            if not page_text:
+                continue
+
+            # 跳过前置页（尤其是前 6 页）
+            if p <= front_matter_max_pages and _is_front_matter_page(page_text):
+                continue
+            # 任何位置出现明显目录页，也跳过
+            if _is_front_matter_page(page_text):
+                continue
+
+            if _looks_like_mda_heading(page_text):
+                start_page = p
                 break
 
-        toc_pages = list(range(toc_page, min(toc_page + 4, 20))) if toc_page is not None else list(range(0, 6))
-        toc_text = self.extract_text(pdf_path, page_numbers=toc_pages)
-
-        # 目录行通常形如：第三节 管理层讨论与分析........14
-        m = re.search(r"第三节\s*管理层讨论与分析[\.·…\s]{2,200}(\d{1,4})", toc_text)
-        if m:
-            try:
-                page_num = int(m.group(1))
-                # 目录页码不可能是 1/2/3 这种（通常 > 5）；小数字很可能误匹配到“(一)/(二)”
-                if page_num >= 5:
-                    start_page = page_num - 1
-                else:
-                    start_page = None
-            except Exception:
-                start_page = None
-        # 1.3) 目录页码与 PDF 物理页号常常不一致：用“候选页”附近扫描校准真正的第三节标题页。
-        # 典型现象：目录标注第三节起始页=11，但 PDF 第11页可能仍是第二节末尾，第三节标题在下一页。
-        if start_page is not None:
-            real_start = None
-            # 在候选页附近（向前2页、向后6页）寻找“第三节 管理层讨论与分析”或“03 管理层讨论与分析”标题页
-            for p in range(max(start_page - 2, 0), start_page + 7):
-                try:
-                    t = self.extract_text(pdf_path, page_numbers=[p])
-                except Exception:
-                    t = ""
-                if not t:
-                    continue
-                # 跳过目录页，目录页经常包含“第三节...11”导致误命中
-                if "目录" in t or "目 录" in t:
-                    continue
-                if re.search(r"第三节\s*管理层讨论与分析", t) or re.search(r"(?:^|\n)\s*0?3\s*管理层讨论与分析", t):
-                    real_start = p
-                    break
-            if real_start is not None:
-                start_page = real_start
-        # 1.5) 起始页校验：避免把“目录页/前言页”误当作第三节正文起点
-        if start_page is not None:
-            # 年报第三节一般不会在很靠前的页（<5 绝大概率是误判/目录页）
-            if start_page < 5:
-                start_page = None
-            else:
-                # 若落在目录页附近或该页包含“目录”，说明仍是目录区域，强制放弃目录定位
-                try:
-                    check_text = self.extract_text(pdf_path, page_numbers=[start_page])
-                except Exception:
-                    check_text = ""
-                if check_text and ("目录" in check_text or "目 录" in check_text):
-                    start_page = None
-                # 若 start_page 仍然落在 toc_pages 范围内，也视为目录页误判
-                if start_page is not None and start_page in toc_pages:
-                    start_page = None
-
-        # 2) 目录失败：正文扫描定位（前200页逐页找“第三节 管理层讨论与分析”）
+        # 若没命中标题页：再找正文锚点（有些标题页是图片，无法提取文本）
         if start_page is None:
-            scan_start = (toc_page + 1) if toc_page is not None else 0
-            for p in range(scan_start, 200):
-                page_text = self.extract_text(pdf_path, page_numbers=[p])
+            for p in range(front_matter_max_pages + 1, 260):
+                try:
+                    page_text = self.extract_text(pdf_path, page_numbers=[p])
+                except Exception:
+                    page_text = ""
                 if not page_text:
                     continue
-                # 跳过目录页（目录页经常包含“第三节…14”导致误命中）
-                if "目录" in page_text or "目 录" in page_text:
+                if _is_front_matter_page(page_text):
                     continue
-                if re.search(r"第三节\s*管理层讨论与分析", page_text):
+                if re.search(r"(?:^|\n)\s*一、报告期内公司从事的主要业务", page_text) or (
+                        "报告期内公司从事的主要业务" in page_text):
                     start_page = p
                     break
 
         if start_page is None:
-            # 非标准年报兜底：没有“第三节 管理层讨论与分析”时，尝试抽取“董事长致辞/董事会报告/业务展望”。
+            # 非标准年报兜底
             alt = self.extract_alt_sections(pdf_path)
             if alt:
                 return alt
-
-            print("未找到第三节起始位置（目录无页码且正文未命中）")
+            print("未找到管理层讨论与分析/经营情况讨论与分析起始位置（已跳过重要提示/目录/释义前置页）")
             return None
 
-        # 2.5) 进一步校准：有些报告的“03 管理层讨论与分析”标题页是图片（无法提取文本），
-        # 但紧随其后的正文页会出现“一、报告期内公司从事的主要业务”等稳定锚点。
-        # 若 start_page 落在第二节尾页（如“分季度主要财务指标/非经常性损益”），这里把起点前移到真正正文页。
+        # 进一步校准：若命中的是章节标题页，向后找真正正文锚点（最多 12 页）
         anchor_patterns = [
-            r"第三节\s*管理层讨论与分析",
-            r"(?:^|\n)\s*0?3\s*管理层讨论与分析",
+            r"管理层讨论[与和]分析",
+            r"经营情况讨论[与和]分析",
             r"(?:^|\n)\s*一、报告期内公司从事的主要业务",
             r"报告期内公司从事的主要业务",
         ]
@@ -748,15 +831,17 @@ class AnnualReportParser:
                 t = ""
             if not t:
                 continue
+            if _is_front_matter_page(t):
+                continue
             if ("分季度主要财务指标" in t) or ("非经常性损益" in t) or ("非经常性损益项目及金额" in t):
-                # 明显是第二节尾部，继续往后找
                 continue
             if any(re.search(pat, t) for pat in anchor_patterns):
                 calibrated = p
                 break
-        if calibrated is not None and calibrated != start_page:
+        if calibrated is not None:
             start_page = calibrated
-        print("第三节正文起始页:", start_page)
+
+        print("MDA正文起始页:", start_page)
 
         # 3) 从起始页开始读到“第三节结束/第四章开始”的边界
         # 注意：不同年报模板的“第四章”不一定写成“第四节”，常见形式：
@@ -791,15 +876,16 @@ class AnnualReportParser:
         if not mda_text:
             return None
 
-        # 强制裁剪到第三节正文开始：优先“第三节/03 管理层讨论与分析”，否则用稳定正文锚点（避免夹带第二节尾页）。
+        # 强制裁剪到正文开始：优先从“管理层讨论与分析/经营情况讨论与分析”标题开始，
+        # 否则用稳定正文锚点（避免夹带前一章尾页）。
         cut_pos = None
-        m3 = re.search(r"第三节\s*管理层讨论与分析", mda_text)
-        if m3:
-            cut_pos = m3.start()
+        m_mda = re.search(r"管理层讨论[与和]分析", mda_text)
+        if m_mda:
+            cut_pos = m_mda.start()
         else:
-            m03 = re.search(r"(?:^|\n)\s*0?3\s*管理层讨论与分析", mda_text)
-            if m03:
-                cut_pos = m03.start()
+            m_ops = re.search(r"经营情况讨论[与和]分析", mda_text)
+            if m_ops:
+                cut_pos = m_ops.start()
             else:
                 m1 = re.search(r"(?:^|\n)\s*一、报告期内公司从事的主要业务", mda_text)
                 if m1:
