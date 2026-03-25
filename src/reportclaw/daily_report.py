@@ -5,6 +5,7 @@ ReportClaw - 每日年报摘录汇总（PDF 生成 + 邮件发送）
 - 从 MySQL（annual_reports + annual_report_mda）读取“新增入库”的年报摘录（以 annual_report_mda.created_at 为准）。
 - 将每个标的的摘要按固定版式渲染为一个汇总 PDF（默认输出到 data/report/）。
 - 可选通过 SMTP 发送邮件（支持多收件人）。
+- rows 字段将包含可选的 `chairman_letter`（董事长致辞/致股东信），如从年报中成功提取。
 
 增量逻辑（不漏发）
 - 以 annual_report_mda.created_at 做增量边界（防重复）：
@@ -288,7 +289,7 @@ def fetch_rows_by_publish_date(conn, publish_date: str):
         """
         SELECT
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          m.industry_section, m.main_business_section, m.future_section, m.full_mda
+          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE r.publish_date = %s
@@ -310,7 +311,7 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
         """
         SELECT
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          m.industry_section, m.main_business_section, m.future_section, m.full_mda
+          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE r.publish_date >= %s AND r.publish_date <= %s
@@ -331,7 +332,7 @@ def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
         """
         SELECT
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          m.industry_section, m.main_business_section, m.future_section, m.full_mda,
+          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
           m.created_at
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
@@ -699,10 +700,26 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
         story.append(Paragraph(header, stock_header))
         story.append(Spacer(1, 3 * mm))
 
+        def add_divider():
+            # 使用文本分界线（更稳定，不易被阅读器当作“横线/页眉页脚”吞掉）
+            story.append(Spacer(1, 2 * mm))
+            story.append(Paragraph("────────────────────────────────", stock_footer))
+            story.append(Spacer(1, 3 * mm))
+
+        # 1) 董事长致辞 / 致股东(投资者)信（如果有）
+        chairman = r.get("chairman_letter")
+        has_chairman = chairman and str(chairman).strip()
+        if has_chairman:
+            story.append(Paragraph("董事长致辞 / 致股东(投资者)信", section_header))
+            story.append(safe_block(str(chairman)))
+            add_divider()
+
+        # 2) 管理层综述
         story.append(Paragraph("管理层综述（摘录）", section_header))
         story.append(safe_block(pick_section_text(r.get("main_business_section"), full_mda)))
-        story.append(Spacer(1, 5 * mm))
 
+        # 3) 未来展望（与上一段用分界线隔开）
+        add_divider()
         story.append(Paragraph("未来展望（摘录）", section_header))
         story.append(safe_block(pick_section_text(r.get("future_section"), "")))
         # 在每个标的摘录末尾再次标记一次股票信息，方便移动端阅读器定位
@@ -833,16 +850,42 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
 
         fut = r.get("future_section") or ""
 
-        body_html = "\n".join(
-            [
-                f"<h2>{_escape_xhtml(header)}</h2>",
-                "<h3>管理层综述（摘录）</h3>",
-                _text_to_xhtml_paras(str(biz)),
-                "<h3>未来展望（摘录）</h3>",
-                _text_to_xhtml_paras(str(fut)),
-                "<p class='center' style='margin-top:1em;'>###########**end****############</p>",
+        chairman = r.get("chairman_letter") or ""
+        chairman = str(chairman).strip()
+
+        parts = [
+            f"<h2>{_escape_xhtml(header)}</h2>",
+        ]
+
+        def add_divider():
+            # EPUB 阅读器可能会弱化/忽略 <hr>，所以用“文本分隔符”做双保险
+            parts.append("<hr class=\"divider\" />")
+            parts.append("<p class=\"sep\">####******####</p>")
+            parts.append("<p class=\"noindent\">&nbsp;</p>")
+
+        # 1) 董事长致辞 / 致股东(投资者)信（如果有）
+        if chairman:
+            parts += [
+                "<h3>董事长致辞 / 致股东(投资者)信</h3>",
+                _text_to_xhtml_paras(chairman),
             ]
-        )
+            add_divider()
+
+        # 2) 管理层综述
+        parts += [
+            "<h3>管理层综述（摘录）</h3>",
+            _text_to_xhtml_paras(str(biz)),
+        ]
+
+        # 3) 未来展望
+        add_divider()
+        parts += [
+            "<h3>未来展望（摘录）</h3>",
+            _text_to_xhtml_paras(str(fut)),
+            "<p class='center' style='margin-top:1em;'>###########**end****############</p>",
+        ]
+
+        body_html = "\n".join(parts)
 
         xhtml = f"""<?xml version='1.0' encoding='utf-8'?>
 <!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.1//EN'
@@ -860,6 +903,8 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
     p {{ margin: 1.4em 0; text-indent: 2em; }}
     p.noindent {{ text-indent: 0; }}
     p.center {{ text-indent: 0; text-align: center; }}
+    p.sep {{ text-indent: 0; text-align: center; margin: 1.0em 0; letter-spacing: 0.08em; }}
+    hr.divider {{ border: 0; border-top: 1px solid #999; margin: 1.2em 0; }}
   </style>
 </head>
 <body>
