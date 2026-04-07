@@ -45,6 +45,9 @@ export https_proxy=http://127.0.0.1:1092
 export http_proxy=http://127.0.0.1:1092
 PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report --no-email --date 2026-02-28
 
+7) 运行时临时覆盖邮件开关（不改写 config.ini）：
+    python src/reportclaw/daily_report.py --email-enabled true
+
 输出
 - PDF：data/report/annual_report_summary_YYYY-MM-DD.pdf
 - 状态：data/state/last_sent.json
@@ -55,6 +58,7 @@ import datetime as dt
 from email.message import EmailMessage
 import smtplib
 import json
+import math
 import re
 import time
 import zipfile
@@ -64,7 +68,8 @@ from xml.sax.saxutils import escape
 import mysql.connector
 
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
+from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
@@ -74,6 +79,184 @@ from reportlab.pdfbase.ttfonts import TTFont
 from pathlib import Path
 
 from reportclaw.sheet_sync import sync_rows_to_google_sheet
+
+# --- Scoring helpers (keyword-based) ---
+# Rules are loaded from conf/score_keywords.json (preferred) or from [scoring] section in config.ini.
+# JSON format example:
+# {
+#   "good": {"0到1": 3, "改善": 2},
+#   "bad": {"过剩": -2, "竞争白热化": -3, "竞争": -1}
+# }
+
+def _load_scoring_rules(cfg: configparser.ConfigParser) -> tuple[dict[str, int], dict[str, int]]:
+    """Return (good_rules, bad_rules) where values are signed ints.
+
+    Priority:
+      1) conf/score_keywords.json
+      2) config.ini [scoring] good_keywords / bad_keywords (comma-separated: kw:score)
+    """
+    good: dict[str, int] = {}
+    bad: dict[str, int] = {}
+
+    json_path = CONF_DIR / "score_keywords.json"
+    if json_path.exists():
+        try:
+            obj = json.loads(json_path.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                g = obj.get("good")
+                b = obj.get("bad")
+                if isinstance(g, dict):
+                    for k, v in g.items():
+                        try:
+                            good[str(k).strip()] = int(v)
+                        except Exception:
+                            continue
+                if isinstance(b, dict):
+                    for k, v in b.items():
+                        try:
+                            bad[str(k).strip()] = int(v)
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+    if (not good and not bad) and cfg is not None and cfg.has_section("scoring"):
+        # Format: "kw:3,kw2:2" ; bad can be negative or positive (we force negative if positive)
+        def _parse_map(s: str) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for part in (s or "").replace(";", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if ":" not in part:
+                    continue
+                k, v = part.split(":", 1)
+                k = k.strip()
+                try:
+                    out[k] = int(v.strip())
+                except Exception:
+                    continue
+            return out
+
+        g = _parse_map(cfg.get("scoring", "good_keywords", fallback=""))
+        b = _parse_map(cfg.get("scoring", "bad_keywords", fallback=""))
+        good.update({k: int(v) for k, v in g.items() if k})
+        for k, v in b.items():
+            if not k:
+                continue
+            vv = int(v)
+            bad[k] = vv if vv <= 0 else -vv
+
+    # sanitize: remove empty keys
+    good = {k: v for k, v in good.items() if k}
+    bad = {k: v for k, v in bad.items() if k}
+    return good, bad
+
+
+def _count_keyword_occurrences(text: str, keyword: str) -> int:
+    """Count non-overlapping occurrences. Case-sensitive by default.
+
+    Note: for Chinese this is usually what we want. For latin keywords users can put both cases.
+    """
+    if not text or not keyword:
+        return 0
+    # Escape keyword for regex; allow optional whitespace between Chinese/latin chunks is NOT applied
+    pat = re.escape(keyword)
+    return len(re.findall(pat, text))
+
+
+def score_report_text(text: str, good_rules: dict[str, int], bad_rules: dict[str, int]) -> dict:
+    """Compute score and hit breakdown.
+
+    Returns dict:
+      {
+        'score': int,
+        'good_hits': list[(kw, cnt, pts)],
+        'bad_hits': list[(kw, cnt, pts)],
+        'good_total': int,
+        'bad_total': int,
+      }
+    """
+    t = text or ""
+    # For scoring we prefer compact text to reduce line-break noise
+    t2 = re.sub(r"\s+", "", t)
+
+    good_hits: list[tuple[str, int, int]] = []
+    bad_hits: list[tuple[str, int, int]] = []
+
+    good_total = 0
+    bad_total = 0
+
+    # Longer keywords first to reduce double counting (e.g. "竞争白热化" vs "竞争")
+    for kw in sorted(good_rules.keys(), key=lambda x: len(x), reverse=True):
+        w = int(good_rules[kw])
+        cnt = _count_keyword_occurrences(t2, kw)
+        if cnt > 0:
+            pts = cnt * w
+            good_total += pts
+            good_hits.append((kw, cnt, pts))
+
+    for kw in sorted(bad_rules.keys(), key=lambda x: len(x), reverse=True):
+        w = int(bad_rules[kw])
+        cnt = _count_keyword_occurrences(t2, kw)
+        if cnt > 0:
+            pts = cnt * w
+            bad_total += pts
+            bad_hits.append((kw, cnt, pts))
+
+    score = good_total + bad_total
+
+    # Sort hits by absolute contribution desc
+    good_hits.sort(key=lambda x: abs(x[2]), reverse=True)
+    bad_hits.sort(key=lambda x: abs(x[2]), reverse=True)
+
+    return {
+        "score": int(score),
+        "good_hits": good_hits,
+        "bad_hits": bad_hits,
+        "good_total": int(good_total),
+        "bad_total": int(bad_total),
+    }
+
+
+def build_row_score(r: dict, good_rules: dict[str, int], bad_rules: dict[str, int]) -> dict:
+    """Score one row based on chairman_letter + main_business_section + future_section.
+
+    We score on the *raw extracted text* to reflect what user reads.
+    """
+    parts = []
+    for k in ("chairman_letter", "main_business_section", "future_section"):
+        v = r.get(k)
+        if v:
+            parts.append(str(v))
+    text = "\n".join(parts)
+    return score_report_text(text, good_rules, bad_rules)
+
+
+def format_score_badge(score_info: dict, max_items: int = 4) -> str:
+    """Format score line for PDF/EPUB."""
+    if not score_info:
+        return ""
+    score = score_info.get("score", 0)
+    g = score_info.get("good_hits") or []
+    b = score_info.get("bad_hits") or []
+
+    def _fmt(items):
+        out = []
+        for kw, cnt, pts in items[:max_items]:
+            sign = "+" if pts > 0 else ""
+            out.append(f"{kw}×{cnt}({sign}{pts})")
+        return "；".join(out)
+
+    good_s = _fmt(g)
+    bad_s = _fmt(b)
+
+    segs = [f"Score: {score}"]
+    if good_s:
+        segs.append(f"+ {good_s}")
+    if bad_s:
+        segs.append(f"- {bad_s}")
+    return " | ".join(segs)
 
  # daily_report.py 位于 src/reportclaw/ 下，所以项目根目录是再向上两级
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -283,13 +466,103 @@ def mysql_connect(cfg: configparser.ConfigParser):
     )
 
 
+
+# --- Helper: detect best available context/sentence column(s) in annual_report_score_hits ---
+def _detect_score_hit_context_expr(conn) -> str:
+    """Return a SQL expression (string) that yields the best available hit context.
+
+    We support multiple schema variants. Newer schema may include:
+      - context_sentence
+      - context
+      - example_text
+
+    Older schema variants may include:
+      - hit_context / hit_sentence / sentence / matched_sentence / excerpt
+
+    The returned expression is safe to embed inside subqueries that alias the table as `h`.
+    If no supported columns exist, returns `''`.
+    """
+    prefer = [
+        "context_sentence",
+        "context",
+        "example_text",
+        "hit_context",
+        "hit_sentence",
+        "sentence",
+        "matched_sentence",
+        "excerpt",
+    ]
+
+    try:
+        db_name = getattr(conn, "database", None)
+        if not db_name:
+            cur0 = conn.cursor()
+            cur0.execute("SELECT DATABASE()")
+            row = cur0.fetchone()
+            cur0.close()
+            db_name = row[0] if row else None
+        if not db_name:
+            return "''"
+
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'annual_report_score_hits'
+            """,
+            (db_name,),
+        )
+        cols = {str(r[0]) for r in (cur.fetchall() or [])}
+        cur.close()
+
+        present = [c for c in prefer if c in cols]
+        if not present:
+            return "''"
+
+        # Build COALESCE(h.`c1`, h.`c2`, ..., '')
+        parts = [f"h.`{c}`" for c in present]
+        return f"COALESCE({', '.join(parts)}, '')"
+
+    except Exception:
+        return "''"
+
+
 def fetch_rows_by_publish_date(conn, publish_date: str):
     cur = conn.cursor(dictionary=True)
+    ctx_expr = _detect_score_hit_context_expr(conn)
     cur.execute(
-        """
+        f"""
         SELECT
+          r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda
+          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
+          (
+            SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_total,
+          (
+            SELECT GROUP_CONCAT(
+              CONCAT(h.keyword, '(', h.hit_count, ')')
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '；'
+            )
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_hits
+          ,(
+            SELECT GROUP_CONCAT(
+              CONCAT(
+                h.keyword, '|', h.weight, '|', h.hit_count, '|',
+                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
+              )
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '\n'
+            )
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_hit_details
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE r.publish_date = %s
@@ -307,11 +580,39 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
     Fetch rows where publish_date between [start_date, end_date] inclusive. Dates are YYYY-MM-DD.
     """
     cur = conn.cursor(dictionary=True)
+    ctx_expr = _detect_score_hit_context_expr(conn)
     cur.execute(
-        """
+        f"""
         SELECT
+          r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda
+          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
+          (
+            SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_total,
+          (
+            SELECT GROUP_CONCAT(
+              CONCAT(h.keyword, '(', h.hit_count, ')')
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '；'
+            )
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_hits
+          ,(
+            SELECT GROUP_CONCAT(
+              CONCAT(
+                h.keyword, '|', h.weight, '|', h.hit_count, '|',
+                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
+              )
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '\n'
+            )
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_hit_details
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE r.publish_date >= %s AND r.publish_date <= %s
@@ -328,12 +629,40 @@ def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
     Fetch rows where annual_report_mda.created_at is in (start_ts, end_ts] (timestamps as strings 'YYYY-MM-DD HH:MM:SS').
     """
     cur = conn.cursor(dictionary=True)
+    ctx_expr = _detect_score_hit_context_expr(conn)
     cur.execute(
-        """
+        f"""
         SELECT
+          r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
           m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
-          m.created_at
+          m.created_at,
+          (
+            SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_total,
+          (
+            SELECT GROUP_CONCAT(
+              CONCAT(h.keyword, '(', h.hit_count, ')')
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '；'
+            )
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_hits
+          ,(
+            SELECT GROUP_CONCAT(
+              CONCAT(
+                h.keyword, '|', h.weight, '|', h.hit_count, '|',
+                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
+              )
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '\n'
+            )
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_hit_details
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
         WHERE m.created_at > %s AND m.created_at <= %s
@@ -343,6 +672,127 @@ def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
     )
     rows = cur.fetchall()
     return rows or []
+
+
+# --- Helper: sort rows by score DESC, then publish_date DESC, then stock_code ASC ---
+def sort_rows_by_score_desc(rows: list[dict]) -> list[dict]:
+    """Sort rows by score_total DESC, then publish_date DESC, then stock_code ASC.
+
+    score_total comes from DB (SUM(weight*hit_count)). Missing/None scores are treated as very small.
+    """
+    def _score(v) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return -10**9
+
+    def _date(v):
+        # publish_date is usually 'YYYY-MM-DD' string; keep None at the end
+        s = str(v).strip() if v is not None else ""
+        return s
+
+    rows = list(rows or [])
+    rows.sort(
+        key=lambda r: (
+            _score(r.get("score_total")),
+            _date(r.get("publish_date")),
+            str(r.get("stock_code", "")),
+        ),
+        reverse=True,
+    )
+
+    # Because reverse=True reverses all tuple components, re-stabilize stock_code ASC inside same score/date.
+    # Do a second stable sort for the ASC fields.
+    rows.sort(
+        key=lambda r: (
+            -_score(r.get("score_total")),
+            "" if r.get("publish_date") is None else str(r.get("publish_date")),
+            str(r.get("stock_code", "")),
+        )
+    )
+    # Now fix publish_date to be DESC while score is already DESC and stock_code ASC:
+    rows.sort(key=lambda r: ( _score(r.get("score_total")), _date(r.get("publish_date")) ), reverse=True)
+
+    return rows
+
+
+# --- Helper: sort rows by time DESC (created_at DESC, then publish_date DESC, then stock_code ASC) ---
+def sort_rows_by_time_desc(rows: list[dict]) -> list[dict]:
+    """Sort rows by time from newest to oldest for the summary section.
+
+    Priority:
+      1) created_at DESC (if present)
+      2) publish_date DESC
+      3) stock_code ASC
+    """
+    rows = list(rows or [])
+
+    def _dt_key(v):
+        if v is None:
+            return dt.datetime.min
+        if isinstance(v, dt.datetime):
+            return v
+        s = str(v).strip()
+        if not s:
+            return dt.datetime.min
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return dt.datetime.strptime(s, fmt)
+            except Exception:
+                pass
+        try:
+            return dt.datetime.fromisoformat(s)
+        except Exception:
+            return dt.datetime.min
+
+    rows.sort(
+        key=lambda r: (
+            _dt_key(r.get("created_at")),
+            _dt_key(r.get("publish_date")),
+            str(r.get("stock_code", "")),
+        ),
+        reverse=True,
+    )
+
+    # Re-stabilize stock_code to ASC while keeping time DESC.
+    rows.sort(
+        key=lambda r: (
+            -int(_dt_key(r.get("created_at")).timestamp()) if _dt_key(r.get("created_at")) != dt.datetime.min else float("inf"),
+            -int(_dt_key(r.get("publish_date")).timestamp()) if _dt_key(r.get("publish_date")) != dt.datetime.min else float("inf"),
+            str(r.get("stock_code", "")),
+        )
+    )
+    return rows
+
+
+# Helper: whether a row should be visible in the score section
+def _row_has_visible_score_entry(r: dict) -> bool:
+    """Whether a row should appear in the front score list.
+
+    Rule:
+    - If DB score_total exists:
+        * hide only when score_total == 0 AND score_hits is empty
+        * otherwise show
+    - If DB score_total is missing:
+        * compute fallback score on the fly
+        * hide only when score == 0 AND no keyword hits at all
+    """
+    db_score = r.get("score_total")
+    hits = r.get("score_hits")
+    hits_s = str(hits).strip() if hits is not None else ""
+
+    if db_score is not None:
+        try:
+            db_score_i = int(db_score)
+        except Exception:
+            db_score_i = 0
+        return not (db_score_i == 0 and not hits_s)
+
+    good_rules, bad_rules = _load_scoring_rules(configparser.ConfigParser())
+    score_info = build_row_score(r, good_rules, bad_rules)
+    total_hits = len(score_info.get("good_hits") or []) + len(score_info.get("bad_hits") or [])
+    score = int(score_info.get("score", 0) or 0)
+    return not (score == 0 and total_hits == 0)
 
 
 
@@ -523,6 +973,73 @@ def clean_text_for_reading(t: str) -> str:
 
 
 def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
+    def _build_score_detail_table(r: dict, max_rows: int = 10):
+        """Build a small table: keyword(score) -> context sentence.
+
+        Expects r['score_hit_details'] formatted as lines:
+          keyword|weight|hit_count|context
+        """
+        raw = (r.get("score_hit_details") or "").strip()
+        if not raw:
+            return None
+
+        rows: list[list] = []
+        for line in raw.split("\n"):
+            line = (line or "").strip()
+            if not line:
+                continue
+            parts = line.split("|", 3)
+            if len(parts) != 4:
+                continue
+            kw, w_s, cnt_s, ctx = parts
+            kw = (kw or "").strip()
+            if not kw:
+                continue
+            try:
+                w = int(str(w_s).strip())
+            except Exception:
+                w = 0
+            try:
+                cnt = int(str(cnt_s).strip())
+            except Exception:
+                cnt = 0
+            pts = w * cnt
+            # Keep full context sentence for the report; only normalize hard line breaks
+            # (context_sentence is expected to already be a single “sentence block” from report_scoring).
+            ctx = (ctx or "").replace("\r", " ").replace("\n", " ").strip()
+            # Avoid pathological whitespace without breaking punctuation
+            ctx = re.sub(r"[ \t]{2,}", " ", ctx)
+            sign = "+" if pts > 0 else ""
+            left = f"{kw}({sign}{pts})"
+            # Use Paragraph so long text wraps nicely
+            rows.append([
+                Paragraph(escape(left), pre),
+                Paragraph(escape(ctx) if ctx else "（无原文）", body),
+            ])
+            if len(rows) >= max_rows:
+                break
+
+        if not rows:
+            return None
+
+        data = [[Paragraph("命中(分数)", pre), Paragraph("原文", pre)]] + rows
+        tbl = Table(data, colWidths=[45 * mm, None])
+        tbl.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.grey),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ]
+            )
+        )
+        return tbl
     """
     将 rows（DB 查询结果）渲染为汇总 PDF。
 
@@ -541,6 +1058,34 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
     """
     styles = getSampleStyleSheet()
     base_font = _ensure_chinese_font(styles)
+    # Load scoring rules from conf/score_keywords.json or config.ini [scoring]
+    # Note: PDF generator does not receive cfg, so it reads the JSON file (preferred).
+    good_rules, bad_rules = _load_scoring_rules(configparser.ConfigParser())
+
+    # --- Cover page drawing helper (blue sky + clouds + title) ---
+    def _draw_cover(canvas, doc_obj):
+        """Draw a simple cover (blue sky + white clouds) and the title on the first page."""
+        canvas.saveState()
+        w, h = A4
+        # sky background
+        canvas.setFillColorRGB(0.52, 0.78, 0.95)
+        canvas.rect(0, 0, w, h, fill=1, stroke=0)
+        # clouds (simple circles)
+        canvas.setFillColorRGB(1, 1, 1)
+        for (cx, cy, r) in [
+            (w*0.25, h*0.78, 26), (w*0.30, h*0.79, 34), (w*0.36, h*0.78, 28),
+            (w*0.65, h*0.70, 30), (w*0.71, h*0.71, 38), (w*0.78, h*0.70, 30),
+        ]:
+            canvas.circle(cx, cy, r, fill=1, stroke=0)
+        # title
+        canvas.setFillColorRGB(0, 0, 0)
+        canvas.setFont(base_font, 22)
+        canvas.drawCentredString(w/2, h*0.52, f"年报摘录汇总")
+        canvas.setFont(base_font, 14)
+        canvas.drawCentredString(w/2, h*0.48, f"{title_date}")
+        canvas.setFont(base_font, 11)
+        canvas.drawCentredString(w/2, h*0.10, "ReportClaw")
+        canvas.restoreState()
 
     h1 = ParagraphStyle(
         name="H1",
@@ -570,6 +1115,15 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
         spaceBefore=8,
         spaceAfter=4,
         alignment=1,  # center
+    )
+    score_line = ParagraphStyle(
+        name="ScoreLine",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=9.8,
+        leading=13.2,
+        spaceBefore=0,
+        spaceAfter=6,
     )
     section_header = ParagraphStyle(
         name="SectionHeader",
@@ -616,8 +1170,20 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
     )
 
     story = []
+
+    score_rows = [r for r in sort_rows_by_score_desc(rows) if _row_has_visible_score_entry(r)]
+    summary_rows = sort_rows_by_time_desc(rows)
+
+    # Cover page placeholder
+    story.append(Spacer(1, 260 * mm))
+    story.append(PageBreak())
+
+    # Content title (kept for PDF readers' search/navigation)
     story.append(Paragraph(f"年报摘录汇总（{title_date}）", h1))
-    story.append(Spacer(1, 6 * mm))
+    story.append(Spacer(1, 4 * mm))
+    if score_rows:
+        story.append(Paragraph("好坏词分数汇总（按分数从高到低）", section_header))
+        story.append(Spacer(1, 2 * mm))
     def pick_section_text(primary: str | None, fallback_full: str, max_chars: int = 12000) -> str | None:
         """Prefer primary section text; otherwise fall back to full_mda.
 
@@ -671,7 +1237,7 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
         html = "<br/>".join(html_lines)
         return Paragraph(html, body)
 
-    for i, r in enumerate(rows):
+    for i, r in enumerate(score_rows):
         file_path = r.get("file_path", "") or ""
         pdf_name = ""
         try:
@@ -698,15 +1264,75 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
             header += " | PARSE_FAILED"
 
         story.append(Paragraph(header, stock_header))
+        # 0) 好坏词分数（来自 annual_report_score_hits / DB）
+        db_score = r.get("score_total")
+        if db_score is not None:
+            try:
+                db_score_i = int(db_score)
+            except Exception:
+                db_score_i = 0
+            hits = r.get("score_hits")
+            hits_s = str(hits).strip() if hits is not None else ""
+            if hits_s:
+                line = f"Score: {db_score_i} | {hits_s}"
+            else:
+                line = f"Score: {db_score_i}"
+            story.append(Paragraph(escape(line), score_line))
+        else:
+            score_info = build_row_score(r, good_rules, bad_rules)
+            score_badge = format_score_badge(score_info, max_items=4)
+            if score_badge:
+                story.append(Paragraph(escape(score_badge), score_line))
+        detail_tbl = _build_score_detail_table(r, max_rows=10)
+        if detail_tbl is not None:
+            story.append(detail_tbl)
+            story.append(Spacer(1, 2 * mm))
         story.append(Spacer(1, 3 * mm))
+        story.append(Paragraph("────────────────────────────────", stock_footer))
+        story.append(Spacer(1, 4 * mm))
+
+        # 1) 董事长致辞 / 致股东(投资者)信（如果有）
+        # (removed for score section)
+        if i < len(score_rows) - 1:
+            story.append(Spacer(1, 2 * mm))
+
+
+    if score_rows:
+        story.append(PageBreak())
+    story.append(Paragraph("摘要部分（按时间从新到旧）", h1))
+    story.append(Spacer(1, 6 * mm))
+
+    for i, r in enumerate(summary_rows):
+        file_path = r.get("file_path", "") or ""
+        pdf_name = ""
+        try:
+            if file_path:
+                pdf_name = Path(str(file_path)).name
+        except Exception:
+            pdf_name = ""
+
+        full_mda = r.get("full_mda") or ""
+        is_parse_failed = full_mda.startswith("[PARSE_FAILED]")
+
+        if pdf_name and len(pdf_name) > 42:
+            pdf_name = pdf_name[:39] + "..."
+
+        header = (
+            f"{r.get('stock_code','')} {r.get('stock_name','')} | {r.get('report_year','')}年年报"
+            f" | 公告 {r.get('publish_date','')}"
+        )
+        if pdf_name:
+            header += f" | 文件 {pdf_name}"
+        if is_parse_failed:
+            header += " | PARSE_FAILED"
+
+        story.append(Paragraph(header, stock_header))
 
         def add_divider():
-            # 使用文本分界线（更稳定，不易被阅读器当作“横线/页眉页脚”吞掉）
             story.append(Spacer(1, 2 * mm))
             story.append(Paragraph("────────────────────────────────", stock_footer))
             story.append(Spacer(1, 3 * mm))
 
-        # 1) 董事长致辞 / 致股东(投资者)信（如果有）
         chairman = r.get("chairman_letter")
         has_chairman = chairman and str(chairman).strip()
         if has_chairman:
@@ -714,29 +1340,23 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
             story.append(safe_block(str(chairman)))
             add_divider()
 
-        # 2) 管理层综述
         story.append(Paragraph("管理层综述（摘录）", section_header))
         story.append(safe_block(pick_section_text(r.get("main_business_section"), full_mda)))
 
-        # 3) 未来展望（与上一段用分界线隔开）
         add_divider()
         story.append(Paragraph("未来展望（摘录）", section_header))
         story.append(safe_block(pick_section_text(r.get("future_section"), "")))
-        # 在每个标的摘录末尾再次标记一次股票信息，方便移动端阅读器定位
         end_mark = header
         story.append(Spacer(1, 3 * mm))
-        # 结尾再次输出股票信息，便于移动端阅读器定位
         story.append(Paragraph(end_mark, stock_footer))
-        # 结尾标记：单独一行 + 额外留白（避免被阅读器当作横线/页眉页脚误删）
         story.append(Spacer(1, 2 * mm))
         story.append(Paragraph("###########**end****############", stock_footer))
         story.append(Spacer(1, 4 * mm))
 
-        if i < len(rows) - 1:
-            # Next ticker on a new page
+        if i < len(summary_rows) - 1:
             story.append(PageBreak())
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_draw_cover)
     return out_path
 
 
@@ -813,6 +1433,12 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
     book_id = str(uuid.uuid4())
     title = f"年报摘录汇总（{title_date}）"
 
+    # Use output filename stem as the short book name, e.g. AR-0319
+    short_name = out_p.stem
+
+    score_rows = [r for r in sort_rows_by_score_desc(rows) if _row_has_visible_score_entry(r)]
+    summary_rows = sort_rows_by_time_desc(rows)
+
     def make_header(r: dict) -> str:
         file_path = r.get("file_path", "") or ""
         pdf_name = ""
@@ -837,7 +1463,60 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
     navpoints = []
     xhtml_files: dict[str, str] = {}
 
-    for idx, r in enumerate(rows, start=1):
+    # Cover page (XHTML) - blue sky + title
+    cover_xhtml = f"""<?xml version='1.0' encoding='utf-8'?>
+<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.1//EN'
+  'http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd'>
+<html xmlns=\"http://www.w3.org/1999/xhtml\">
+<head>
+  <title>{_escape_xhtml(short_name)}</title>
+  <meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <style type=\"text/css\">
+    body {{ margin: 0; padding: 0; }}
+    .cover {{
+      min-height: 100vh;
+      background: linear-gradient(#84c6f2, #dff3ff);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      font-family: serif;
+      line-height: 1.6;
+    }}
+    .box {{ padding: 2.2em 1.4em; }}
+    .t1 {{ font-size: 1.6em; font-weight: bold; }}
+    .t2 {{ margin-top: 0.6em; font-size: 1.0em; }}
+    .t3 {{ margin-top: 1.6em; font-size: 0.95em; opacity: 0.85; }}
+  </style>
+</head>
+<body>
+  <div class=\"cover\"><div class=\"box\">
+    <div class=\"t1\">{_escape_xhtml(short_name)}</div>
+    <div class=\"t2\">年报摘录汇总</div>
+    <div class=\"t3\">{_escape_xhtml(title_date)}</div>
+  </div></div>
+</body>
+</html>
+"""
+
+    # Register cover as first chapter
+    xhtml_files["OEBPS/cover.xhtml"] = cover_xhtml
+    manifest_items.append(("cover", "cover.xhtml", "application/xhtml+xml"))
+    spine_items.append("cover")
+    navpoints.append(
+        f"""<navPoint id=\"navPoint-cover\" playOrder=\"1\">
+  <navLabel><text>{_escape_xhtml(short_name)}</text></navLabel>
+  <content src=\"cover.xhtml\"/>
+</navPoint>"""
+    )
+
+    # Shift subsequent chapter playOrder by +1
+    play_order_base = 1
+    # Load scoring rules once for all rows
+    good_rules, bad_rules = _load_scoring_rules(configparser.ConfigParser())
+
+    for idx, r in enumerate(score_rows, start=1):
         header = make_header(r)
         full_mda = r.get("full_mda") or ""
 
@@ -855,35 +1534,27 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
 
         parts = [
             f"<h2>{_escape_xhtml(header)}</h2>",
+            "<h3>好坏词分数</h3>",
         ]
+        db_score = r.get("score_total")
+        if db_score is not None:
+            try:
+                db_score_i = int(db_score)
+            except Exception:
+                db_score_i = 0
+            hits = r.get("score_hits")
+            hits_s = str(hits).strip() if hits is not None else ""
+            if hits_s:
+                parts.append(f"<p class=\"noindent\"><strong>{_escape_xhtml('Score: ' + str(db_score_i) + ' | ' + hits_s)}</strong></p>")
+            else:
+                parts.append(f"<p class=\"noindent\"><strong>{_escape_xhtml('Score: ' + str(db_score_i))}</strong></p>")
+        else:
+            score_info = build_row_score(r, good_rules, bad_rules)
+            badge = format_score_badge(score_info, max_items=4)
+            if badge:
+                parts.append(f"<p class=\"noindent\"><strong>{_escape_xhtml(badge)}</strong></p>")
 
-        def add_divider():
-            # EPUB 阅读器可能会弱化/忽略 <hr>，所以用“文本分隔符”做双保险
-            parts.append("<hr class=\"divider\" />")
-            parts.append("<p class=\"sep\">####******####</p>")
-            parts.append("<p class=\"noindent\">&nbsp;</p>")
-
-        # 1) 董事长致辞 / 致股东(投资者)信（如果有）
-        if chairman:
-            parts += [
-                "<h3>董事长致辞 / 致股东(投资者)信</h3>",
-                _text_to_xhtml_paras(chairman),
-            ]
-            add_divider()
-
-        # 2) 管理层综述
-        parts += [
-            "<h3>管理层综述（摘录）</h3>",
-            _text_to_xhtml_paras(str(biz)),
-        ]
-
-        # 3) 未来展望
-        add_divider()
-        parts += [
-            "<h3>未来展望（摘录）</h3>",
-            _text_to_xhtml_paras(str(fut)),
-            "<p class='center' style='margin-top:1em;'>###########**end****############</p>",
-        ]
+        parts.append("<p class=\"sep\">────────────────────────────────</p>")
 
         body_html = "\n".join(parts)
 
@@ -920,12 +1591,92 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
         manifest_items.append((item_id, f"chap{idx:03d}.xhtml", "application/xhtml+xml"))
         spine_items.append(item_id)
 
+        play_order = idx + play_order_base
         navpoints.append(
-            f"""<navPoint id=\"navPoint-{idx}\" playOrder=\"{idx}\">
+            f"""<navPoint id=\"navPoint-{play_order}\" playOrder=\"{play_order}\">
   <navLabel><text>{_escape_xhtml(r.get('stock_code',''))} {_escape_xhtml(r.get('stock_name',''))}</text></navLabel>
   <content src=\"chap{idx:03d}.xhtml\"/>
 </navPoint>"""
         )
+
+    if not score_rows:
+        # keep score section empty when no company has visible score entries
+        pass
+    summary_idx = len(score_rows) + 1
+    summary_parts = [
+        "<h2>摘要部分（按时间从新到旧）</h2>",
+    ]
+
+    for r in summary_rows:
+        header = make_header(r)
+        full_mda = r.get("full_mda") or ""
+
+        biz = r.get("main_business_section") or ""
+        if (not str(biz).strip()) and full_mda:
+            biz = full_mda
+            if str(biz).startswith("[PARSE_FAILED]"):
+                parts2 = str(biz).split("\n", 1)
+                biz = parts2[1] if len(parts2) == 2 else ""
+
+        fut = r.get("future_section") or ""
+        chairman = str(r.get("chairman_letter") or "").strip()
+
+        summary_parts.append(f"<h3>{_escape_xhtml(header)}</h3>")
+        if chairman:
+            summary_parts += [
+                "<h4>董事长致辞 / 致股东(投资者)信</h4>",
+                _text_to_xhtml_paras(chairman),
+                "<hr class=\"divider\" />",
+            ]
+
+        summary_parts += [
+            "<h4>管理层综述（摘录）</h4>",
+            _text_to_xhtml_paras(str(biz)),
+            "<hr class=\"divider\" />",
+            "<h4>未来展望（摘录）</h4>",
+            _text_to_xhtml_paras(str(fut)),
+            "<p class='center' style='margin-top:1em;'>###########**end****############</p>",
+            "<p class=\"sep\">────────────────────────────────</p>",
+        ]
+
+    summary_body_html = "\n".join(summary_parts)
+    summary_xhtml = f"""<?xml version='1.0' encoding='utf-8'?>
+<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.1//EN'
+  'http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd'>
+<html xmlns=\"http://www.w3.org/1999/xhtml\">
+<head>
+  <title>{_escape_xhtml(short_name)} 摘要</title>
+  <meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <style type=\"text/css\">
+    body {{ font-family: serif; line-height: 1.7; margin: 0 0.9em; }}
+    h2 {{ margin-top: 0.8em; font-size: 1.15em; }}
+    h3 {{ margin-top: 1.0em; font-size: 1.05em; }}
+    h4 {{ margin-top: 0.9em; font-size: 1.0em; }}
+    p {{ margin: 1.4em 0; text-indent: 2em; }}
+    p.noindent {{ text-indent: 0; }}
+    p.center {{ text-indent: 0; text-align: center; }}
+    p.sep {{ text-indent: 0; text-align: center; margin: 1.0em 0; letter-spacing: 0.08em; }}
+    hr.divider {{ border: 0; border-top: 1px solid #999; margin: 1.2em 0; }}
+  </style>
+</head>
+<body>
+{summary_body_html}
+</body>
+</html>
+"""
+
+    summary_fn = f"OEBPS/chap{summary_idx:03d}.xhtml"
+    xhtml_files[summary_fn] = summary_xhtml
+    summary_item_id = f"chap{summary_idx:03d}"
+    manifest_items.append((summary_item_id, f"chap{summary_idx:03d}.xhtml", "application/xhtml+xml"))
+    spine_items.append(summary_item_id)
+    navpoints.append(
+        f"""<navPoint id=\"navPoint-{summary_idx + play_order_base}\" playOrder=\"{summary_idx + play_order_base}\">
+  <navLabel><text>摘要部分（按时间从新到旧）</text></navLabel>
+  <content src=\"chap{summary_idx:03d}.xhtml\"/>
+</navPoint>"""
+    )
 
     manifest_xml = "\n".join(
         [
@@ -938,7 +1689,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
     opf = f"""<?xml version='1.0' encoding='utf-8'?>
 <package xmlns=\"http://www.idpf.org/2007/opf\" unique-identifier=\"BookId\" version=\"2.0\">
   <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">
-    <dc:title>{_escape_xhtml(title)}</dc:title>
+    <dc:title>{_escape_xhtml(short_name)} - {_escape_xhtml(title)}</dc:title>
     <dc:language>zh-CN</dc:language>
     <dc:identifier id=\"BookId\">urn:uuid:{book_id}</dc:identifier>
   </metadata>
@@ -1123,6 +1874,7 @@ def parse_args():
     p.add_argument("--config", default=str(CONF_DIR / "config.ini"), help="Path to config.ini (default: conf/config.ini)")
     p.add_argument("--today-only", action="store_true", help="Force sending only today's created_at (ignore last_sent history).")
     p.add_argument("--epub", action="store_true", help="Also generate an EPUB alongside the PDF")
+    p.add_argument("--email-enabled", default=None, choices=["true", "false"], help="Temporarily override [email] enabled with true/false for this run only")
     return p.parse_args()
 
 def load_config(path: str) -> configparser.ConfigParser:
@@ -1177,6 +1929,7 @@ def main():
                 print(f"{day} 无披露年报记录，不生成汇总PDF")
                 return
 
+            rows = sort_rows_by_score_desc(rows)
             generate_daily_summary_pdf(rows, out_pdf, range_label)
             print(f"已生成每日汇总PDF: {out_pdf}")
             epub_enabled = args.epub or cfg.get("epub", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
@@ -1242,6 +1995,7 @@ def main():
                 # 不推进 last_generated_iso：避免出现“后续补入库但 created_at 落在旧窗口内”而被永远跳过。
                 return
 
+            rows = sort_rows_by_score_desc(rows)
             generate_daily_summary_pdf(rows, out_pdf, range_label)
             print(f"已生成每日汇总PDF: {out_pdf}")
             out_epub: str | None = None
@@ -1264,6 +2018,8 @@ def main():
                 return
 
     enabled = cfg.get("email", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
+    if args.email_enabled is not None:
+        enabled = str(args.email_enabled).lower() == "true"
     if args.no_email:
         enabled = False
 

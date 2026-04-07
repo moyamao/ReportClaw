@@ -66,6 +66,7 @@ import concurrent.futures
 from typing import Any
 
 from pathlib import Path
+import signal
 
 # main.py 位于 src/reportclaw/ 下，所以项目根目录是再向上两级
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -177,7 +178,12 @@ def _parse_pdf_task(args: tuple[str, int | None, str | None, int | None]) -> dic
         }
     except Exception as e:
         elapsed = time.perf_counter() - t0
-        reason = f"exception:{type(e).__name__}"
+        msg = str(e) or ""
+        if "IMAGE_HEAVY_SKIP" in msg:
+            reason = "image_heavy_skip"
+        else:
+            reason = f"exception:{type(e).__name__}"
+
         fb = parser.build_fallback_mda(file_path, reason=reason, page_count=int(page_count or 0))
         return {
             "ok": False,
@@ -401,6 +407,105 @@ class MySQLClient:
 # PDF解析器
 # ===============================
 class AnnualReportParser:
+
+    def _compress_tables_keep_head_tail(
+        self,
+        text: str,
+        *,
+        min_run: int = 10,
+        head_keep: int = 3,
+        tail_keep: int = 3,
+    ) -> str:
+        """Compress long table-like blocks to keep readability and avoid false end-markers.
+
+        Heuristic:
+        - Detect consecutive runs of "table-like" short lines (>= min_run lines).
+        - Keep the first `head_keep` and last `tail_keep` lines.
+        - Replace the middle with an ellipsis + hint.
+
+        This is intentionally conservative: it only triggers on long runs.
+        """
+        if not text:
+            return ""
+
+        lines = text.split("\n")
+        out: list[str] = []
+
+        def is_table_like_line(ln: str) -> bool:
+            s = (ln or "").strip()
+            if not s:
+                return False
+
+            # If a line looks like normal prose (Chinese punctuation), treat it as NOT a table.
+            if any(p in s for p in ("。", "！", "？")):
+                return False
+
+            compact = re.sub(r"\s+", "", s)
+            # Very short lines are unlikely to be meaningful paragraphs.
+            if len(compact) <= 2:
+                return False
+
+            # Common table separators
+            if any(ch in s for ch in ("|", "│", "┆", "┊", "—", "-")) and re.search(r"\d", s):
+                return True
+
+            # "Short" lines with lots of digits/percent/commas are likely table rows.
+            if len(compact) <= 40:
+                digit_cnt = sum(c.isdigit() for c in compact)
+                if digit_cnt >= 6:
+                    return True
+                if digit_cnt >= 3 and ("," in compact or "%" in compact or "‰" in compact):
+                    return True
+
+            # Dense numeric tokens without sentence punctuation
+            if len(compact) <= 50 and re.fullmatch(r"[0-9,\.\-+%‰/（）()\u4e00-\u9fffA-Za-z]{10,}", compact):
+                # Still require at least some digits to avoid matching random headings.
+                if re.search(r"\d", compact):
+                    return True
+
+            return False
+
+        i = 0
+        n = len(lines)
+        while i < n:
+            if not is_table_like_line(lines[i]):
+                out.append(lines[i])
+                i += 1
+                continue
+
+            # Start a run
+            j = i
+            while j < n and is_table_like_line(lines[j]):
+                j += 1
+            run_len = j - i
+
+            if run_len >= min_run:
+                head = lines[i : i + head_keep]
+                tail = lines[max(i, j - tail_keep) : j]
+                out.extend(head)
+                out.append("…（此处为表格，已省略中间内容；建议查看报告原文PDF）…")
+                out.extend(tail)
+            else:
+                out.extend(lines[i:j])
+
+            i = j
+
+        # Keep line breaks mostly as-is, but avoid huge blank runs
+        res = "\n".join(out)
+        res = re.sub(r"\n{4,}", "\n\n\n", res)
+        return res
+
+    def _preprocess_text_for_extract(self, text: str) -> str:
+        """Preprocess extracted text while preserving layout as much as possible.
+
+        - Normalize newlines and page breaks
+        - Compress long table blocks
+        """
+        if not text:
+            return ""
+        t = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0c", "\n")
+        t = self._compress_tables_keep_head_tail(t)
+        return t
     def normalize_for_letter(self, text: str) -> str:
         """A gentler normalizer for chairman letter extraction.
 
@@ -411,6 +516,8 @@ class AnnualReportParser:
         """
         if not text:
             return ""
+
+        text = self._preprocess_text_for_extract(text)
 
         text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0c", "\n")
         # keep at most 2 consecutive blank lines
@@ -470,6 +577,84 @@ class AnnualReportParser:
             print(f"[{tag}] {msg}")
         else:
             print(msg)
+
+    def _is_image_heavy_pdf(
+            self,
+            pdf_path: str,
+            *,
+            sample_pages: int = 8,
+            min_images: int = 20,
+            max_total_text_chars: int = 800,
+            min_avg_text_chars_per_page: int = 90,
+            max_file_mb: int = 30,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Heuristic preflight to detect image-heavy PDFs that are very slow to parse by pdfminer.
+
+        A PDF is considered image-heavy only when BOTH:
+          - images in sampled pages are high
+          - extracted text is very low
+        """
+        stats: dict[str, Any] = {
+            "file_mb": None,
+            "sample_pages": sample_pages,
+            "images": 0,
+            "text_chars": 0,
+            "avg_text_chars": 0,
+        }
+
+        try:
+            sz = os.path.getsize(pdf_path)
+            stats["file_mb"] = round(sz / (1024 * 1024), 2)
+        except Exception:
+            stats["file_mb"] = None
+
+        large_file = isinstance(stats["file_mb"], (int, float)) and stats["file_mb"] >= max_file_mb
+
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                n = min(sample_pages, len(pdf.pages))
+                img_cnt = 0
+                txt_cnt = 0
+                for i in range(n):
+                    p = pdf.pages[i]
+
+                    # image count (cheap)
+                    try:
+                        img_cnt += len(getattr(p, "images", []) or [])
+                    except Exception:
+                        pass
+
+                    # text probe (cheap)
+                    try:
+                        s = p.extract_text() or ""
+                        txt_cnt += len(re.sub(r"\s+", "", s))
+                    except Exception:
+                        pass
+
+                stats["images"] = img_cnt
+                stats["text_chars"] = txt_cnt
+                stats["avg_text_chars"] = int(txt_cnt / max(n, 1))
+        except Exception as e:
+            stats["open_error"] = f"{type(e).__name__}: {e}"
+            return False, stats
+
+        img_heavy = stats["images"] >= min_images
+        low_text = (stats["text_chars"] <= max_total_text_chars) or (
+                stats["avg_text_chars"] <= min_avg_text_chars_per_page
+        )
+
+        # Primary rule: many images + very low text in sampled pages
+        if img_heavy and low_text:
+            return True, stats
+
+        # Secondary rule: very large file + still image-leaning + lowish text
+        if large_file and (stats["images"] >= max(8, min_images // 2)) and (
+                stats["avg_text_chars"] <= (min_avg_text_chars_per_page * 2)
+        ):
+            return True, stats
+
+        return False, stats
+
 
     def _extract_between_markers(self, text: str, start_pat: str, end_pats: list[str], *, flags=re.MULTILINE):
         """Extract substring starting at start_pat until earliest match of any end_pats."""
@@ -710,6 +895,22 @@ class AnnualReportParser:
 
         This is independent from MDA extraction to avoid breaking existing logic.
         """
+        # Preflight: if front matter is image-heavy, skip quickly.
+        is_heavy, st = self._is_image_heavy_pdf(
+            pdf_path,
+            sample_pages=min(6, max_pages),
+            min_images=16,
+            max_total_text_chars=500,
+            min_avg_text_chars_per_page=80,
+            max_file_mb=30,
+        )
+        if is_heavy:
+            self._log(
+                f"[perf] image-heavy front matter, skip chairman letter. "
+                f"file_mb={st.get('file_mb')} images={st.get('images')} text_chars={st.get('text_chars')} avg_text_chars={st.get('avg_text_chars')}"
+            )
+            return "[CHAIRMAN_LETTER_HINT] 该PDF前部页面图片占比高，董事长致辞正文抽取失败概率大；建议打开原PDF查看。"
+
         try:
             raw_front = pdfminer_extract_text(pdf_path, page_numbers=list(range(0, max_pages))) or ""
             front = self.normalize_for_letter(raw_front)
@@ -1231,6 +1432,19 @@ class AnnualReportParser:
         - Do NOT dump front-matter (重要提示/目录/释义) into summaries.
         - If parsing fails, prefer telling the user to read the original PDF.
         """
+        # Fast-path: for image-heavy PDFs we intentionally skip deep extraction to save time.
+        if reason == "image_heavy_skip":
+            pdf_name = os.path.basename(pdf_path)
+            base = f"[PARSE_FAILED] reason={reason} pages={page_count}\n请查看原PDF：{pdf_name}"
+            hint = "[PARSE_SKIPPED_IMAGE_HEAVY] 该PDF图文混排/图片占比高，文本抽取成本很高且成功率低；建议直接打开原PDF查看。"
+            return {
+                "industry": None,
+                "business": None,
+                "future": None,
+                "chairman_letter": hint,
+                "full_mda": base,
+            }
+
         excerpt = ""
         try:
             probe_pages = list(range(0, min(40, max(int(page_count or 0), 1))))
@@ -1332,6 +1546,7 @@ class AnnualReportParser:
     def normalize(self, text):
         # 统一换行/去除不可见分页符
         text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0c", "\n")
+        text = self._compress_tables_keep_head_tail(text)
 
         # 先做一次基本清理
         text = re.sub(r"\n+", "\n", text)
@@ -1385,6 +1600,16 @@ class AnnualReportParser:
 
     def extract_mda(self, pdf_path):
 
+        # Preflight: skip extremely image-heavy PDFs early to avoid multi-minute pdfminer stalls.
+        is_heavy, st = self._is_image_heavy_pdf(pdf_path)
+        if is_heavy:
+            self._log(
+                f"[perf] image-heavy PDF detected, skip parse. "
+                f"file_mb={st.get('file_mb')} sample_pages={st.get('sample_pages')} "
+                f"images={st.get('images')} text_chars={st.get('text_chars')} avg_text_chars={st.get('avg_text_chars')}"
+            )
+            raise RuntimeError("IMAGE_HEAVY_SKIP")
+
         # 1) 直接正文扫描定位：不要依赖目录页码（目录/重要提示/释义常导致误判）
         # 目标：找到“管理层讨论与分析/经营情况讨论与分析”的真实正文起点页。
         start_page = None
@@ -1398,18 +1623,45 @@ class AnnualReportParser:
             nonlocal _pages, _n_pages
             if _pages:
                 return
-            try:
-                raw = pdfminer_extract_text(pdf_path, page_numbers=list(range(0, max_pages))) or ""
-            except Exception:
-                raw = ""
-            if not raw:
+
+            # PERF GUARD:
+            # pdfminer 对“复杂矢量/图文混排/超长表格/扫描图”的 PDF 可能分钟级卡顿。
+            # 用分批抽取 + 总耗时预算，避免单个 PDF 拖垮整批任务。
+            batch_size = 20
+            max_total_seconds = 60.0  # 单个PDF在pages-cache阶段的总预算（你可以调小到30）
+            max_batch_seconds = 20.0  # 单个batch预算（超过就认为该PDF极慢）
+
+            raw_pages_all: list[str] = []
+            t0 = time.perf_counter()
+
+            for start in range(0, max_pages, batch_size):
+                # 总预算
+                if (time.perf_counter() - t0) > max_total_seconds:
+                    raise RuntimeError("PARSE_TOO_SLOW")
+
+                end = min(max_pages, start + batch_size)
+                page_nums = list(range(start, end))
+
+                tb = time.perf_counter()
+                try:
+                    raw_part = pdfminer_extract_text(pdf_path, page_numbers=page_nums) or ""
+                except Exception:
+                    raw_part = ""
+                batch_elapsed = time.perf_counter() - tb
+
+                # 单batch都很慢：直接熔断
+                if batch_elapsed > max_batch_seconds:
+                    raise RuntimeError("PARSE_TOO_SLOW")
+
+                if raw_part:
+                    raw_pages_all.extend(re.split(r"\x0c|\f", raw_part))
+
+            if not raw_pages_all:
                 _pages = []
                 _n_pages = 0
                 return
 
-            # pdfminer 用 \x0c(\f) 做分页符；normalize() 会把它抹掉，所以这里先切页再逐页 normalize。
-            raw_pages = re.split(r"\x0c|\f", raw)
-            _pages = [self.normalize(p) for p in raw_pages]
+            _pages = [self.normalize(p) for p in raw_pages_all]
             _n_pages = len(_pages)
 
         def _get_page_text(p: int) -> str:
@@ -1453,33 +1705,75 @@ class AnnualReportParser:
             return False
 
         def _looks_like_mda_heading(t: str) -> bool:
+            """Return True only when the page contains a REAL MDA chapter heading line.
+
+            This must be strict to avoid false positives from front-matter cross references,
+            e.g. “重大风险提示…详见第三节‘管理层讨论与分析’…敬请查阅”.
+            """
             if not t:
                 return False
 
-            bad_words = ("详见", "敬请", "查阅", "参阅", "阅读", "提示")
-            kw = ("管理层讨论与分析", "经营情况讨论与分析")
+            compact_page = re.sub(r"\s+", "", t)
+
+            # Strong reject: front-matter risk hints often mention the MDA chapter.
+            if ("重大风险提示" in compact_page or "风险提示" in compact_page or "重要提示" in compact_page) and (
+                "管理层讨论与分析" in compact_page or "经营情况讨论与分析" in compact_page
+            ):
+                return False
+
+            # Another strong reject: explicit cross-reference language.
+            if ("详见" in compact_page or "敬请查阅" in compact_page or "请查阅" in compact_page or "参阅" in compact_page) and (
+                "管理层讨论与分析" in compact_page or "经营情况讨论与分析" in compact_page
+            ):
+                return False
+
+            # Accept only standalone heading-like short lines.
+            heading_line_pats = [
+                r"^第三节管理层讨论[与和]分析$",
+                r"^第三节经营情况讨论[与和]分析$",
+                r"^管理层讨论[与和]分析$",
+                r"^经营情况讨论[与和]分析$",
+                r"^第(?:[一二三四五六七八九十0-9]{1,3})节(?:管理层讨论[与和]分析|经营情况讨论[与和]分析)$",
+                r"^(?:第三部分|第三章)管理层讨论[与和]分析$",
+                r"^(?:第三部分|第三章)经营情况讨论[与和]分析$",
+            ]
 
             for ln in t.split("\n"):
                 s = (ln or "").strip()
                 if not s:
                     continue
 
-                # 引用句排雷：出现“详见/敬请查阅”等 + 关键词，直接否
-                if any(w in s for w in bad_words) and any(k in s for k in kw):
+                # If the line contains quote marks / book-title marks, it is very likely a reference sentence.
+                if any(q in s for q in ("“", "”", "\"", "'", "《", "》")):
                     continue
-
-                # 引号/书名号排雷：大概率是“详见第三节…”那类引用
-                if any(q in s for q in ('“', '”', '"', "'", '《', '》')) and any(k in s for k in kw):
-                    # 但允许纯标题（很短）
-                    if len(re.sub(r"\s+", "", s)) > 20:
-                        continue
 
                 s2 = re.sub(r"\s+", "", s)
-                if len(s2) > 60:
+                if len(s2) > 40:
                     continue
 
-                # 只要是“标题式短行”包含关键词就接受
-                if any(k in s2 for k in kw):
+                for pat in heading_line_pats:
+                    if re.match(pat, s2):
+                        return True
+
+            # Fallback: sometimes the heading line is merged with adjacent text.
+            # Accept when the page contains the heading phrase in a heading-like context,
+            # but reject cross-reference sentences like “详见…第三节…敬请查阅”.
+            m_any = re.search(r"第三节\s*管理层讨论[与和]分析|第三节\s*经营情况讨论[与和]分析", t)
+            if m_any:
+                # Look at a small window around the hit to detect cross references.
+                ctx0 = max(0, m_any.start() - 30)
+                ctx1 = min(len(t), m_any.end() + 30)
+                ctx = re.sub(r"\s+", "", t[ctx0:ctx1])
+                if any(x in ctx for x in ("详见", "敬请查阅", "请查阅", "参阅")):
+                    return False
+                # Also reject if the same line contains quotes/book-title marks (very likely a reference)
+                line_start = t.rfind("\n", 0, m_any.start())
+                line_end = t.find("\n", m_any.end())
+                line = t[(line_start + 1 if line_start >= 0 else 0):(line_end if line_end >= 0 else len(t))]
+                if any(q in line for q in ("“", "”", "\"", "'", "《", "》")):
+                    return False
+                # If it's short-ish, treat as a heading page.
+                if len(re.sub(r"\s+", "", line)) <= 60:
                     return True
 
             return False
@@ -1534,8 +1828,8 @@ class AnnualReportParser:
 
         # 进一步校准：若命中的是章节标题页，向后找真正正文锚点（最多 12 页）
         anchor_patterns = [
-            r"管理层讨论[与和]分析",
-            r"经营情况讨论[与和]分析",
+            # NOTE: do NOT calibrate using plain '管理层讨论与分析/经营情况讨论与分析' substring,
+            # because many pages contain cross-references like “详见第三节...”.
 
             # 业务情况（覆盖：一、/二、/三、… 以及 1、/2、/3、…）
             r"(?:^|\n)\s*(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]\s*报告期内公司所?(?:从事|经营)的(?:主要)?业务情况",
@@ -1555,7 +1849,8 @@ class AnnualReportParser:
                 continue
             if ("分季度主要财务指标" in t) or ("非经常性损益" in t) or ("非经常性损益项目及金额" in t):
                 continue
-            if any(re.search(pat, t) for pat in anchor_patterns):
+            # Prefer a real heading page; otherwise use business-anchor patterns.
+            if _looks_like_mda_heading(t) or any(re.search(pat, t) for pat in anchor_patterns):
                 calibrated = p
                 break
         if calibrated is not None:
@@ -2247,6 +2542,10 @@ def main():
 
                 if not stock_code or not stock_name or not timestamp:
                     continue
+                # Exclude B-shares: SZ B-share uses 200xxx/201xxx, SH B-share uses 900xxx.
+                # These are typically bilingual/English-heavy PDFs and not part of the A-share universe.
+                if str(stock_code).startswith(("200", "201", "900")):
+                    continue
 
                 if isinstance(timestamp, int):
                     ts = timestamp / 1000 if timestamp > 1e12 else timestamp
@@ -2333,6 +2632,9 @@ def main():
     for c in candidates:
         file_path = c["file_path"]
         if not os.path.exists(file_path):
+            continue
+        # Safety: never parse B-shares
+        if str(c.get("stock_code") or "").startswith(("200", "201", "900")):
             continue
 
         # 页数判断（短 PDF 直接跳过）

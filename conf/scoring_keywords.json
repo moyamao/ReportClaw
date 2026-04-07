@@ -1,0 +1,17 @@
+{
+  "positive": { "0到1": 30 },
+  "negative": { "过剩": -20, "竞争白热化": -30 },
+  "cagr_rules": [
+    {
+      "_comment": "cap 是此规则的最高加分；k: 0.1 —— 斜率（每增长 1 个百分点加多少分）；window_chars 在关键字附近取多大一段文本来找百分比、找负面词",
+      "enabled": true,
+      "phrase": "同比增长",
+      "negate_if_contains": ["负债","成本","销售费用","管理费用","财务费用","研发费用","营业成本","期间费用"],
+      "mode": "linear",
+      "k": 0.1,
+      "cap": 12,
+      "min_pct": 20,
+      "window_chars": 120
+    }
+  ]
+}
