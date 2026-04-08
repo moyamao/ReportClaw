@@ -44,6 +44,7 @@ Notes
 Run examples
 ------------
 PYTHONPATH=src ./venv/bin/python -m reportclaw.report_scoring --since-days 45
+PYTHONPATH=src ./venv/bin/python -m reportclaw.report_scoring  # 默认从 data/state/last_sent.json 的 last_crawl_end_iso 开始
 PYTHONPATH=src ./venv/bin/python -m reportclaw.report_scoring --report-id 123
 PYTHONPATH=src ./venv/bin/python -m reportclaw.report_scoring --dry-run
 """
@@ -116,6 +117,38 @@ class MySQLCfg:
 def _project_root() -> Path:
     # src/reportclaw/report_scoring.py -> repo root is parents[2]
     return Path(__file__).resolve().parents[2]
+
+def _default_state_path() -> Path:
+    return _project_root() / "data" / "state" / "last_sent.json"
+
+
+def _load_start_time_from_state(state_path: Path) -> Optional[datetime]:
+    """Load scoring start time from state file.
+
+    Expected field:
+      - last_crawl_end_iso
+
+    Returns naive datetime or None when unavailable.
+    """
+    if not state_path.exists():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    raw = data.get("last_crawl_end_iso")
+    if not raw:
+        return None
+
+    try:
+        s = str(raw).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
 
 
 def load_mysql_cfg(config_path: Path) -> MySQLCfg:
@@ -730,8 +763,9 @@ def _merge_report_text(row: Dict[str, Any]) -> str:
 
 def fetch_reports_to_score(
     db: MySQL,
-    since_days: int,
+    since_days: Optional[int],
     report_id: Optional[int] = None,
+    start_time: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     if report_id is not None:
         sql = """
@@ -742,6 +776,20 @@ def fetch_reports_to_score(
         WHERE r.id = %s
         """
         return db.query(sql, (report_id,))
+
+    if start_time is not None:
+        sql = """
+        SELECT r.id AS report_id, r.stock_code, r.stock_name, r.report_year, r.publish_date,
+               m.chairman_letter, m.industry_section, m.main_business_section, m.future_section, m.full_mda
+        FROM annual_reports r
+        JOIN annual_report_mda m ON m.report_id = r.id
+        WHERE r.created_at >= %s
+        ORDER BY r.publish_date DESC, r.id DESC
+        """
+        return db.query(sql, (start_time,))
+
+    if since_days is None:
+        raise RuntimeError("since_days and start_time cannot both be None")
 
     # Score recent reports by publish_date
     since_date = (datetime.now() - timedelta(days=since_days)).date()
@@ -818,8 +866,8 @@ def main():
     ap.add_argument(
         "--since-days",
         type=int,
-        default=60,
-        help="Score reports whose publish_date is within N days (default 60)",
+        default=None,
+        help="Score reports whose publish_date is within N days. If omitted, use data/state/last_sent.json:last_crawl_end_iso as start time.",
     )
     ap.add_argument(
         "--report-id",
@@ -830,6 +878,18 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="Do not write DB")
 
     args = ap.parse_args()
+
+    state_path = _default_state_path()
+    start_time: Optional[datetime] = None
+    if args.report_id is None and args.since_days is None:
+        start_time = _load_start_time_from_state(state_path)
+        if start_time is None:
+            args.since_days = 60
+            print(f"[score] state file missing/invalid, fallback to --since-days {args.since_days}: {state_path}")
+        else:
+            print(f"[score] using state start_time from last_crawl_end_iso: {start_time} ({state_path})")
+    elif args.since_days is not None:
+        print(f"[score] using explicit --since-days {args.since_days}")
 
     cfg = load_mysql_cfg(Path(args.config))
 
@@ -874,7 +934,12 @@ def main():
     try:
         ensure_schema(db)
 
-        rows = fetch_reports_to_score(db, since_days=args.since_days, report_id=args.report_id)
+        rows = fetch_reports_to_score(
+            db,
+            since_days=args.since_days,
+            report_id=args.report_id,
+            start_time=start_time,
+        )
         if not rows:
             print("[score] no reports to score")
             return

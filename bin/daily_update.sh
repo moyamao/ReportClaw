@@ -4,9 +4,10 @@ set -euo pipefail
 # ReportClaw 定时更新脚本
 # 作用：
 # 1) 先跑 main.py 抓取/解析当天增量数据
-# 2) 再跑 daily_report.py；如果有新数据则生成文档并发邮件，没有新数据则自动跳过
-# 3) 不改写 conf/config.ini，避免影响你平时调试配置
-# 4) 运行 daily_report.py 时临时传入 [email] enabled=true 的覆盖配置
+# 2) 再跑 report_scoring.py，默认不传 since-days，由程序自行决定起始时间（优先取状态文件）
+# 3) 再跑 daily_report.py；如果有新数据则生成文档并发邮件，没有新数据则自动跳过
+# 4) 不改写 conf/config.ini，避免影响你平时调试配置
+# 5) 运行 daily_report.py 时临时传入 [email] enabled=true 的覆盖配置
 #
 # 建议由 launchd / cron 在每天 08:00 和 21:00 调用本脚本。
 
@@ -65,11 +66,24 @@ if ! PYTHONPATH="$PROJECT_ROOT/src" "$VENV_PY" -m reportclaw.main >> "$LOG_FILE"
 fi
 log "main.py 执行完成"
 
-# 2) 跑 daily_report.py
+# 2) 跑 report_scoring.py，不显式传 since-days，默认由程序优先读取状态文件中的起始时间
+log "开始运行 report_scoring.py（默认模式：优先取状态文件起始时间）"
+if ! PYTHONPATH="$PROJECT_ROOT/src" "$VENV_PY" -m reportclaw.report_scoring >> "$LOG_FILE" 2>&1; then
+  log "report_scoring.py 执行失败，任务终止"
+  exit 1
+fi
+log "report_scoring.py 执行完成"
+
+# 3) 跑 daily_report.py
 #    - 不加 --no-email，因为我们就是要发邮件
 #    - 通过命令行临时覆盖 [email] enabled=true，不污染 config.ini
 #    - 使用模块方式启动，避免 reportclaw 包导入失败
 #    - daily_report.py 自己会判断是否有新增记录；如果没有，会输出提示并直接结束
+#    - 更新 Google Sheet 等外网访问走本机代理
+export HTTPS_PROXY=http://127.0.0.1:1092
+export HTTP_PROXY=http://127.0.0.1:1092
+export https_proxy=http://127.0.0.1:1092
+export http_proxy=http://127.0.0.1:1092
 log "开始运行 daily_report.py（临时覆盖 [email] enabled=true）"
 if ! PYTHONPATH="$PROJECT_ROOT/src" "$VENV_PY" -m reportclaw.daily_report --config "$CONFIG_PATH" --email-enabled true >> "$LOG_FILE" 2>&1; then
   log "daily_report.py 执行失败，任务终止"

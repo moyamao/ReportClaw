@@ -1,6 +1,7 @@
 # 功能描述
 - 抓取A股年报，截取最关键的管理层综述和未来展望部分，存入数据库。
 - 生成pdf，发送到邮箱。
+  - 
 
 ## 配置文件
 
@@ -34,6 +35,16 @@ PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report
 ./data/state/last_sent.json
 ```
 
+## 设置每日自动执行
+- 创建文件 ~/Library/LaunchAgents/com.mhy.reportclaw.dailyupdate.plist
+内容如：com.mhy.reportclaw.dailyupdate.plist
+- 然后执行
+```
+launchctl unload ~/Library/LaunchAgents/com.mhy.reportclaw.dailyupdate.plist 2>/dev/null
+launchctl load ~/Library/LaunchAgents/com.mhy.reportclaw.dailyupdate.plist
+launchctl start com.mhy.reportclaw.dailyupdate
+```
+
 ## 常用sql
 
 - 删除某个公司某年的财报
@@ -64,3 +75,4 @@ FROM annual_reports r
 JOIN annual_report_mda m ON m.report_id = r.id
 WHERE r.stock_code='000408' AND r.report_year=2025;
 ```
+
