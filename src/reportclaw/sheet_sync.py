@@ -128,6 +128,9 @@ DEFAULT_HEADER = [
     # --- program fields ---
     "key",
     "stock_name",
+    "申万行业1",
+    "申万行业2",
+    "申万行业3",
     "publish_date",
     "pdf_name",
     # --- manual fields (do NOT overwrite) ---
@@ -400,6 +403,7 @@ def _sync_rows_to_worksheet(
 
     for r in rows:
         key = _make_key(r, mode=key_mode)
+        sw1, sw2, sw3 = _extract_sw_industries(r)
         pdf_path = str(r.get("file_path", "") or "")
         pdf_name = Path(pdf_path).name if pdf_path else ""
 
@@ -415,6 +419,9 @@ def _sync_rows_to_worksheet(
         row_values = [
             key,
             str(r.get("stock_name", "") or ""),
+            sw1,
+            sw2,
+            sw3,
             publish_date,
             pdf_name,
             "",  # score (manual)
@@ -427,7 +434,7 @@ def _sync_rows_to_worksheet(
             appends.append(row_values)
 
     if updates:
-        _batch_update_rows_A_to_D(sheets, spreadsheet_id, worksheet, updates)
+        _batch_update_rows_program_cols(sheets, spreadsheet_id, worksheet, updates)
     if appends:
         _append_rows(sheets, spreadsheet_id, worksheet, appends)
 
@@ -625,6 +632,48 @@ def _cfg_bool(cfg: configparser.ConfigParser, section: str, key: str, default: b
     except Exception:
         return default
 
+def _col_letter(n: int) -> str:
+    """Convert 1-based column index to Excel/Sheets column letters."""
+    if n <= 0:
+        raise ValueError("column index must be >= 1")
+    s = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+PROGRAM_COL_COUNT = 7  # key, stock_name, sw1, sw2, sw3, publish_date, pdf_name
+
+
+def _extract_sw_industries(r: Dict[str, Any]) -> Tuple[str, str, str]:
+    def _pick(*keys: str) -> str:
+        for k in keys:
+            v = r.get(k)
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
+        return ""
+
+    lvl1 = _pick(
+        "sw_industry1", "sw_industry_1", "sw_level1", "sw_level_1",
+        "shenwan_industry1", "shenwan_industry_1", "shenwan_level1", "shenwan_level_1",
+        "industry_l1", "industry_level1", "industry_level_1",
+        "申万行业1",
+    )
+    lvl2 = _pick(
+        "sw_industry2", "sw_industry_2", "sw_level2", "sw_level_2",
+        "shenwan_industry2", "shenwan_industry_2", "shenwan_level2", "shenwan_level_2",
+        "industry_l2", "industry_level2", "industry_level_2",
+        "申万行业2",
+    )
+    lvl3 = _pick(
+        "sw_industry3", "sw_industry_3", "sw_level3", "sw_level_3",
+        "shenwan_industry3", "shenwan_industry_3", "shenwan_level3", "shenwan_level_3",
+        "industry_l3", "industry_level3", "industry_level_3",
+        "申万行业3",
+    )
+    return lvl1, lvl2, lvl3
+
 
 def _guess_project_root() -> Path:
     # sheet_sync.py 通常位于 src/reportclaw/ 下
@@ -737,7 +786,7 @@ def _ensure_worksheet_and_header(
         print(f"[sheets] 创建 worksheet: {worksheet}")
 
     # Check header row
-    rng = f"{worksheet}!A1:F1"
+    rng = f"{worksheet}!A1:{_col_letter(len(header))}1"
     values = sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute().get("values", [])
 
     # --- schema migration: shrink columns (drop stock_code, report_year, tags) ---
@@ -799,6 +848,7 @@ def _ensure_worksheet_and_header(
                 spreadsheetId=spreadsheet_id, range=rng
             ).execute().get("values", [])
 
+
     # --- schema migration: old header without publish_date (legacy) ---
     # Old (8 cols): key, stock_code, stock_name, report_year, pdf_name, score, tags, notes
     # We first insert publish_date at E, then apply the shrink migration above on next run.
@@ -827,6 +877,40 @@ def _ensure_worksheet_and_header(
             }
             sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
             print("[sheets] schema migration: inserted publish_date column (E)")
+            values = sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=rng
+            ).execute().get("values", [])
+
+    # --- schema migration: current 6-column sheet -> add Shenwan industry columns ---
+    # Old (6 cols): key, stock_name, publish_date, pdf_name, score, notes
+    # New (9 cols): key, stock_name, 申万行业1, 申万行业2, 申万行业3, publish_date, pdf_name, score, notes
+    if values and values[0]:
+        old = values[0]
+        if old[:6] == [
+            "key",
+            "stock_name",
+            "publish_date",
+            "pdf_name",
+            "score",
+            "notes",
+        ]:
+            req = {
+                "requests": [
+                    {
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 2,
+                                "endIndex": 5,
+                            },
+                            "inheritFromBefore": True,
+                        }
+                    }
+                ]
+            }
+            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
+            print("[sheets] schema migration: inserted 申万行业1/2/3 columns")
             values = sheets.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id, range=rng
             ).execute().get("values", [])
@@ -864,17 +948,17 @@ def _read_existing_key_map(sheets, spreadsheet_id: str, worksheet: str) -> Dict[
 
 
 
-def _batch_update_rows_A_to_D(
+def _batch_update_rows_program_cols(
     sheets, spreadsheet_id: str, worksheet: str, updates: List[Tuple[int, List[Any]]]
 ) -> None:
     """
-    Update only columns A:D (program columns), leaving manual columns E:F untouched.
+    Update only program-maintained columns, leaving manual columns untouched.
     """
     data = []
+    end_col = _col_letter(PROGRAM_COL_COUNT)
     for row_idx, row_values in updates:
-        # A:D are first 4 columns
-        vals = row_values[:4]
-        rng = f"{worksheet}!A{row_idx}:D{row_idx}"
+        vals = row_values[:PROGRAM_COL_COUNT]
+        rng = f"{worksheet}!A{row_idx}:{end_col}{row_idx}"
         data.append({"range": rng, "values": [vals]})
 
     body = {"valueInputOption": "RAW", "data": data}

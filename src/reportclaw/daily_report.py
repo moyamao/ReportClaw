@@ -536,6 +536,7 @@ def fetch_rows_by_publish_date(conn, publish_date: str):
         SELECT
           r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
+          r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
           m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
           (
             SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
@@ -586,6 +587,7 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
         SELECT
           r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
+          r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
           m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
           (
             SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
@@ -635,6 +637,7 @@ def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
         SELECT
           r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
+          r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
           m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
           m.created_at,
           (
@@ -1125,6 +1128,25 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
         spaceBefore=0,
         spaceAfter=6,
     )
+    industry_line = ParagraphStyle(
+        name="IndustryLine",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=9.8,
+        leading=13.2,
+        spaceBefore=0,
+        spaceAfter=6,
+    )
+    def format_industry_line(r: dict) -> str:
+        inds = []
+        for k in ("sw_l1_name", "sw_l2_name", "sw_l3_name"):
+            v = r.get(k)
+            s = str(v).strip() if v is not None else ""
+            if s:
+                inds.append(s)
+        if not inds:
+            return "申万行业：未获取"
+        return "申万行业：" + " / ".join(inds)
     section_header = ParagraphStyle(
         name="SectionHeader",
         parent=styles["Heading3"],
@@ -1264,6 +1286,7 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
             header += " | PARSE_FAILED"
 
         story.append(Paragraph(header, stock_header))
+        story.append(Paragraph(escape(format_industry_line(r)), industry_line))
         # 0) 好坏词分数（来自 annual_report_score_hits / DB）
         db_score = r.get("score_total")
         if db_score is not None:
@@ -1327,6 +1350,7 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
             header += " | PARSE_FAILED"
 
         story.append(Paragraph(header, stock_header))
+        story.append(Paragraph(escape(format_industry_line(r)), industry_line))
 
         def add_divider():
             story.append(Spacer(1, 2 * mm))
@@ -1423,6 +1447,70 @@ def _text_to_xhtml_paras(t: str) -> str:
             out.append(f"<p>{inner}</p>")
 
     return "\n".join(out) if out else "<p>（未提取到内容）</p>"
+
+
+def _score_details_to_xhtml(r: dict, max_rows: int = 20) -> str:
+    """Render score hit details for EPUB.
+
+    Input format in r['score_hit_details']:
+      keyword|weight|hit_count|context
+
+    We intentionally keep more rows than PDF and avoid truncating context aggressively,
+    because the user needs to inspect this section in EPUB.
+    """
+    raw = (r.get("score_hit_details") or "").strip()
+    if not raw:
+        return ""
+
+    items: list[str] = []
+    count = 0
+    for line in raw.split("\n"):
+        line = (line or "").strip()
+        if not line:
+            continue
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            continue
+        kw, w_s, cnt_s, ctx = parts
+        kw = (kw or "").strip()
+        if not kw:
+            continue
+        try:
+            w = int(str(w_s).strip())
+        except Exception:
+            w = 0
+        try:
+            cnt = int(str(cnt_s).strip())
+        except Exception:
+            cnt = 0
+        pts = w * cnt
+        sign = "+" if pts > 0 else ""
+
+        ctx = (ctx or "").replace("\r", " ").replace("\n", " ").strip()
+        ctx = re.sub(r"[ \t]{2,}", " ", ctx)
+        ctx_html = _text_to_xhtml_paras(ctx) if ctx else "<p>（无原文）</p>"
+
+        items.append(
+            "\n".join(
+                [
+                    f"<div class=\"score-item\">",
+                    f"  <p class=\"score-key noindent\"><strong>{_escape_xhtml(kw)}({sign}{pts})</strong></p>",
+                    f"  <div class=\"score-ctx\">{ctx_html}</div>",
+                    f"</div>",
+                ]
+            )
+        )
+        count += 1
+        if count >= max_rows:
+            break
+
+    if not items:
+        return ""
+
+    return "\n".join([
+        "<h3>关键词命中明细</h3>",
+        *items,
+    ])
 
 
 def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
@@ -1554,6 +1642,10 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
             if badge:
                 parts.append(f"<p class=\"noindent\"><strong>{_escape_xhtml(badge)}</strong></p>")
 
+        score_details_html = _score_details_to_xhtml(r, max_rows=20)
+        if score_details_html:
+            parts.append(score_details_html)
+
         parts.append("<p class=\"sep\">────────────────────────────────</p>")
 
         body_html = "\n".join(parts)
@@ -1576,6 +1668,9 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
     p.center {{ text-indent: 0; text-align: center; }}
     p.sep {{ text-indent: 0; text-align: center; margin: 1.0em 0; letter-spacing: 0.08em; }}
     hr.divider {{ border: 0; border-top: 1px solid #999; margin: 1.2em 0; }}
+    .score-item {{ margin: 1.0em 0 1.4em 0; padding: 0.5em 0.7em; border: 1px solid #d8d8d8; }}
+    .score-key {{ margin: 0 0 0.4em 0; text-indent: 0; }}
+    .score-ctx p {{ margin: 0.6em 0; }}
   </style>
 </head>
 <body>
