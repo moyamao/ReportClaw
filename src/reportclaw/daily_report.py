@@ -78,7 +78,40 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 from pathlib import Path
 
+
 from reportclaw.sheet_sync import sync_rows_to_google_sheet
+
+
+def sync_rows_to_google_sheet_with_retry(cfg, rows, run_date, max_attempts: int = 5, base_sleep: float = 3.0):
+    """Retry Google Sheets sync on transient quota/rate-limit errors.
+
+    This keeps the main flow resilient when Sheets API returns 429 / quota exceeded.
+    """
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return sync_rows_to_google_sheet(cfg, rows, run_date=run_date)
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            is_retryable = (
+                "429" in msg
+                or "Quota exceeded" in msg
+                or "RATE_LIMIT_EXCEEDED" in msg
+                or "Read requests per minute per user" in msg
+                or "User rate limit exceeded" in msg
+                or "too many requests" in msg.lower()
+            )
+            if (not is_retryable) or attempt >= max_attempts:
+                raise
+            sleep_s = base_sleep * (2 ** (attempt - 1))
+            print(
+                f"[sheets] 同步触发限流，准备重试 {attempt}/{max_attempts}，"
+                f"{sleep_s:.1f}s 后继续：{e}"
+            )
+            time.sleep(sleep_s)
+    if last_err is not None:
+        raise last_err
 
 # --- Scoring helpers (keyword-based) ---
 # Rules are loaded from conf/score_keywords.json (preferred) or from [scoring] section in config.ini.
@@ -537,6 +570,9 @@ def fetch_rows_by_publish_date(conn, publish_date: str):
           r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
           r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
+          r.sw_l1_name AS sw_industry1,
+          r.sw_l2_name AS sw_industry2,
+          r.sw_l3_name AS sw_industry3,
           m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
           (
             SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
@@ -588,6 +624,9 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
           r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
           r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
+          r.sw_l1_name AS sw_industry1,
+          r.sw_l2_name AS sw_industry2,
+          r.sw_l3_name AS sw_industry3,
           m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
           (
             SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
@@ -638,6 +677,9 @@ def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
           r.id AS report_id,
           r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
           r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
+          r.sw_l1_name AS sw_industry1,
+          r.sw_l2_name AS sw_industry2,
+          r.sw_l3_name AS sw_industry3,
           m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
           m.created_at,
           (
@@ -1546,6 +1588,17 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
             header += f" | 文件 {pdf_name}"
         return header
 
+    def make_industry_line(r: dict) -> str:
+        inds = []
+        for k in ("sw_l1_name", "sw_l2_name", "sw_l3_name", "sw_industry1", "sw_industry2", "sw_industry3"):
+            v = r.get(k)
+            s = str(v).strip() if v is not None else ""
+            if s and s not in inds:
+                inds.append(s)
+        if not inds:
+            return "申万行业：未获取"
+        return "申万行业：" + " / ".join(inds)
+
     manifest_items = []
     spine_items = []
     navpoints = []
@@ -1606,6 +1659,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
 
     for idx, r in enumerate(score_rows, start=1):
         header = make_header(r)
+        industry_line = make_industry_line(r)
         full_mda = r.get("full_mda") or ""
 
         biz = r.get("main_business_section") or ""
@@ -1622,6 +1676,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
 
         parts = [
             f"<h2>{_escape_xhtml(header)}</h2>",
+            f"<p class=\"noindent industry\">{_escape_xhtml(industry_line)}</p>",
             "<h3>好坏词分数</h3>",
         ]
         db_score = r.get("score_total")
@@ -1665,6 +1720,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
     /* More visible paragraph breaks + first-line indent in EPUB */
     p {{ margin: 1.4em 0; text-indent: 2em; }}
     p.noindent {{ text-indent: 0; }}
+    p.industry {{ margin: 0.5em 0 1.0em 0; color: #444; }}
     p.center {{ text-indent: 0; text-align: center; }}
     p.sep {{ text-indent: 0; text-align: center; margin: 1.0em 0; letter-spacing: 0.08em; }}
     hr.divider {{ border: 0; border-top: 1px solid #999; margin: 1.2em 0; }}
@@ -1704,6 +1760,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
 
     for r in summary_rows:
         header = make_header(r)
+        industry_line = make_industry_line(r)
         full_mda = r.get("full_mda") or ""
 
         biz = r.get("main_business_section") or ""
@@ -1717,6 +1774,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
         chairman = str(r.get("chairman_letter") or "").strip()
 
         summary_parts.append(f"<h3>{_escape_xhtml(header)}</h3>")
+        summary_parts.append(f"<p class=\"noindent industry\">{_escape_xhtml(industry_line)}</p>")
         if chairman:
             summary_parts += [
                 "<h4>董事长致辞 / 致股东(投资者)信</h4>",
@@ -1750,6 +1808,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
     h4 {{ margin-top: 0.9em; font-size: 1.0em; }}
     p {{ margin: 1.4em 0; text-indent: 2em; }}
     p.noindent {{ text-indent: 0; }}
+    p.industry {{ margin: 0.5em 0 1.0em 0; color: #444; }}
     p.center {{ text-indent: 0; text-align: center; }}
     p.sep {{ text-indent: 0; text-align: center; margin: 1.0em 0; letter-spacing: 0.08em; }}
     hr.divider {{ border: 0; border-top: 1px solid #999; margin: 1.2em 0; }}
@@ -2034,7 +2093,7 @@ def main():
                 print(f"已生成每日汇总EPUB: {out_epub}")
             # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
             try:
-                sync_rows_to_google_sheet(cfg, rows, run_date=run_date)
+                sync_rows_to_google_sheet_with_retry(cfg, rows, run_date=run_date)
             except Exception as e:
                 print(f"[sheets] 同步失败（忽略，不影响主流程）：{e}")
         else:
@@ -2101,7 +2160,7 @@ def main():
                 print(f"已生成每日汇总EPUB: {out_epub}")
             # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
             try:
-                sync_rows_to_google_sheet(cfg, rows, run_date=run_date)
+                sync_rows_to_google_sheet_with_retry(cfg, rows, run_date=run_date)
             except Exception as e:
                 print(f"[sheets] 同步失败（忽略，不影响主流程）：{e}")
             # 成功生成日报后推进 last_generated_iso：确保“已经出现在报表里的公司”不会在第二天重复出现

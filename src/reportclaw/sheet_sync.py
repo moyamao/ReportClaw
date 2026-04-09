@@ -47,6 +47,7 @@ from __future__ import annotations
 import configparser
 import datetime as dt
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -220,6 +221,7 @@ def sync_rows_to_google_sheet(
                 header=DEFAULT_HEADER,
                 key_mode=key_mode,
             )
+            time.sleep(1.2)
         print(f"[sheets] 月度同步完成：tabs={len(buckets)}")
         if tab_auto_sort:
             _auto_sort_tabs(
@@ -249,6 +251,7 @@ def sync_rows_to_google_sheet(
                 header=DEFAULT_HEADER,
                 key_mode=key_mode,
             )
+            time.sleep(1.2)
         print(f"[sheets] 周度同步完成：tabs={len(buckets)}")
         if tab_auto_sort:
             _auto_sort_tabs(
@@ -379,6 +382,7 @@ def _maybe_sync_daily_snapshot(
             key_mode=key_mode,
         )
         print(f"[sheets_daily] {tab}: 同步完成（rows={len(rs)}）")
+        time.sleep(1.2)
 
     if tab_auto_sort:
         _auto_sort_tabs_daily(sheets, spreadsheet_id, desc=tab_sort_desc)
@@ -645,6 +649,35 @@ def _col_letter(n: int) -> str:
 
 PROGRAM_COL_COUNT = 7  # key, stock_name, sw1, sw2, sw3, publish_date, pdf_name
 
+def _is_retryable_sheets_error(e: Exception) -> bool:
+    msg = str(e)
+    return (
+        "429" in msg
+        or "Quota exceeded" in msg
+        or "RATE_LIMIT_EXCEEDED" in msg
+        or "Read requests per minute per user" in msg
+        or "User rate limit exceeded" in msg
+        or "too many requests" in msg.lower()
+    )
+
+
+def _execute_with_backoff(call, action: str, max_attempts: int = 6, base_sleep: float = 3.0):
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return call.execute()
+        except Exception as e:
+            last_err = e
+            if (not _is_retryable_sheets_error(e)) or attempt >= max_attempts:
+                raise
+            sleep_s = base_sleep * (2 ** (attempt - 1))
+            print(
+                f"[sheets] {action} 触发限流，准备重试 {attempt}/{max_attempts}，"
+                f"{sleep_s:.1f}s 后继续：{e}"
+            )
+            time.sleep(sleep_s)
+    if last_err is not None:
+        raise last_err
 
 def _extract_sw_industries(r: Dict[str, Any]) -> Tuple[str, str, str]:
     def _pick(*keys: str) -> str:
@@ -768,7 +801,10 @@ def _ensure_worksheet_and_header(
     Ensure worksheet exists and first row is header.
     Returns sheetId.
     """
-    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = _execute_with_backoff(
+        sheets.spreadsheets().get(spreadsheetId=spreadsheet_id),
+        f"读取 spreadsheet 元数据 {worksheet}"
+    )
     sheets_info = meta.get("sheets", [])
 
     sheet_id = None
@@ -781,13 +817,19 @@ def _ensure_worksheet_and_header(
     if sheet_id is None:
         # Create sheet
         req = {"requests": [{"addSheet": {"properties": {"title": worksheet}}}]}
-        resp = sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
+        resp = _execute_with_backoff(
+            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req),
+            f"创建 worksheet {worksheet}"
+        )
         sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
         print(f"[sheets] 创建 worksheet: {worksheet}")
 
     # Check header row
     rng = f"{worksheet}!A1:{_col_letter(len(header))}1"
-    values = sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute().get("values", [])
+    values = _execute_with_backoff(
+        sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng),
+        f"读取表头 {worksheet}!A1"
+    ).get("values", [])
 
     # --- schema migration: shrink columns (drop stock_code, report_year, tags) ---
     # Old (9 cols): key, stock_code, stock_name, report_year, publish_date, pdf_name, score, tags, notes
@@ -841,12 +883,16 @@ def _ensure_worksheet_and_header(
                     },
                 ]
             }
-            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
+            _execute_with_backoff(
+                sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req),
+                f"表结构迁移 {worksheet}"
+            )
             print("[sheets] schema migration: removed columns stock_code/report_year/tags")
             # Re-read header after deleting columns
-            values = sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=rng
-            ).execute().get("values", [])
+            values = _execute_with_backoff(
+                sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng),
+                f"迁移后重读表头 {worksheet}!A1"
+            ).get("values", [])
 
 
     # --- schema migration: old header without publish_date (legacy) ---
@@ -875,11 +921,15 @@ def _ensure_worksheet_and_header(
                     }
                 ]
             }
-            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
+            _execute_with_backoff(
+                sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req),
+                f"表结构迁移 {worksheet}"
+            )
             print("[sheets] schema migration: inserted publish_date column (E)")
-            values = sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=rng
-            ).execute().get("values", [])
+            values = _execute_with_backoff(
+                sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng),
+                f"迁移后重读表头 {worksheet}!A1"
+            ).get("values", [])
 
     # --- schema migration: current 6-column sheet -> add Shenwan industry columns ---
     # Old (6 cols): key, stock_name, publish_date, pdf_name, score, notes
@@ -909,21 +959,27 @@ def _ensure_worksheet_and_header(
                     }
                 ]
             }
-            sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
+            _execute_with_backoff(
+                sheets.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req),
+                f"表结构迁移 {worksheet}"
+            )
             print("[sheets] schema migration: inserted 申万行业1/2/3 columns")
-            values = sheets.spreadsheets().values().get(
-                spreadsheetId=spreadsheet_id, range=rng
-            ).execute().get("values", [])
+            values = _execute_with_backoff(
+                sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng),
+                f"迁移后重读表头 {worksheet}!A1"
+            ).get("values", [])
 
     if not values or values[0][: len(header)] != header:
         body = {"values": [header]}
-        sheets.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{worksheet}!A1",
-            valueInputOption="RAW",
-            body=body,
-        ).execute()
-        print("[sheets] 写入/修复 header")
+        _execute_with_backoff(
+            sheets.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{worksheet}!A1",
+                valueInputOption="RAW",
+                body=body,
+            ),
+            f"写入表头 {worksheet}!A1"
+        )
 
     return int(sheet_id)
 
@@ -933,7 +989,10 @@ def _read_existing_key_map(sheets, spreadsheet_id: str, worksheet: str) -> Dict[
     Read column A (key) and build key -> 1-based row index.
     """
     rng = f"{worksheet}!A2:A"
-    resp = sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+    resp = _execute_with_backoff(
+        sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng),
+        f"读取已有key {rng}"
+    )
     values = resp.get("values", []) or []
 
     mp: Dict[str, int] = {}
@@ -962,18 +1021,24 @@ def _batch_update_rows_program_cols(
         data.append({"range": rng, "values": [vals]})
 
     body = {"valueInputOption": "RAW", "data": data}
-    sheets.spreadsheets().values().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
+    _execute_with_backoff(
+        sheets.spreadsheets().values().batchUpdate(spreadsheetId=spreadsheet_id, body=body),
+        f"批量写入 {worksheet} program cols"
+    )
 
 
 def _append_rows(sheets, spreadsheet_id: str, worksheet: str, rows: List[List[Any]]) -> None:
     body = {"values": rows}
-    sheets.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range=f"{worksheet}!A1",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body=body,
-    ).execute()
+    _execute_with_backoff(
+        sheets.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{worksheet}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ),
+        f"追加写入 {worksheet}"
+    )
 
 
 def _upload_pdf_to_drive(drive, file_path: str, folder_id: Optional[str]) -> str:
