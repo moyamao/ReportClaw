@@ -415,8 +415,16 @@ def _mask_spans(text: str, needle: str) -> Tuple[str, int]:
 
 
 
+from typing import Optional, Iterable
+
 # --- Helper: extract sentence/snippet for keyword context ---
-def _extract_sentence_around(text: str, idx: int, stop_chars: str, max_len: int = 1800) -> str:
+def _extract_sentence_around(
+    text: str,
+    idx: int,
+    stop_chars: str,
+    max_len: int = 1800,
+    boundary_chars_override: Optional[Iterable[str]] = None,
+) -> str:
     """Return the clause containing position idx.
 
     We treat Chinese punctuation as boundaries: 。！？； and also English '.' ';' '?' '!'.
@@ -429,7 +437,10 @@ def _extract_sentence_around(text: str, idx: int, stop_chars: str, max_len: int 
 
     # Sentence boundaries should be real punctuation only.
     # IMPORTANT: do NOT treat '.' as a boundary because it often appears in decimals like 39.24%.
-    boundary_chars = set((stop_chars or "")) | {"。", "！", "？", "；", ";", "?", "!"}
+    if boundary_chars_override is not None:
+        boundary_chars = set(boundary_chars_override)
+    else:
+        boundary_chars = set((stop_chars or "")) | {"。", "！", "？", "；", ";", "?", "!"}
     boundary_chars.discard("\n")
     boundary_chars.discard("\r")
 
@@ -505,30 +516,42 @@ def _collect_keyword_sentences(text: str, kw: str, stop_chars: str, max_sentence
 
 def _looks_table_noise(s: str) -> bool:
     """Heuristic: detect table-like / directory-like noisy snippets.
-    If true, we should not dump the whole clause; instead use a short window around the match.
+
+    Important:
+    - This function should be conservative.
+    - Normal narrative正文 often contains many numbers / percentages, especially in annual reports.
+    - Only classify as table-noise when the text is both long and strongly tabular.
     """
     if not s:
         return False
-    t = re.sub(r"\s+", " ", s)
+    t = re.sub(r"\s+", " ", s).strip()
+    if not t:
+        return False
 
     digits = sum(ch.isdigit() for ch in t)
     pct = t.count("%")
     pipes = t.count("|")
     commas = t.count(",") + t.count("，")
 
+    # If there is clear narrative punctuation, we should be much less aggressive.
+    has_narrative_punc = any(ch in t for ch in ("。", "；", "！", "？", ";", "!", "?"))
+
+    # Very explicit table/index markers.
     if re.search(r"(单位[:：]|同比增减|金额|占比|毛利率|营业收入|营业成本|现金流|项目|合计|本期数|上期数)", t):
         return True
 
-    if len(t) >= 260 and (digits / max(1, len(t)) > 0.22):
-        return True
-
-    if pct >= 3 and len(t) >= 180:
-        return True
-
+    # Pipe-delimited or highly comma-separated long rows are usually table-like.
     if pipes >= 2 and len(t) >= 140:
         return True
+    if commas >= 14 and len(t) >= 260 and not has_narrative_punc:
+        return True
 
-    if commas >= 12 and len(t) >= 220:
+    # Dense numeric blocks without normal sentence punctuation.
+    if len(t) >= 420 and (digits / max(1, len(t)) > 0.26) and not has_narrative_punc:
+        return True
+
+    # Many percentages in a long non-narrative block.
+    if pct >= 5 and len(t) >= 260 and not has_narrative_punc:
         return True
 
     return False
@@ -549,6 +572,17 @@ def _extract_window_around(text: str, idx: int, window: int = 180) -> str:
         s = "…" + s
     if b < n:
         s = s.rstrip() + "…"
+    return s
+
+
+def _normalize_cagr_context_for_dedupe(s: str) -> str:
+    """Normalize CAGR context so exact same content is only scored once.
+
+    We intentionally keep digits/percentages/Chinese text, but collapse whitespace.
+    """
+    s = str(s or "")
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
@@ -575,6 +609,7 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
     hits: List[Hit] = []
 
     pct_re = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+    seen_exact: set[tuple[str, str]] = set()
 
     for r in rules:
         if not isinstance(r, dict):
@@ -589,6 +624,15 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
         # Never stop at commas for CAGR scanning/context (we only stop at sentence-ending punctuation)
         stop_chars = stop_chars.replace(",", "").replace("，", "")
         stop_re = re.compile("[" + re.escape(stop_chars) + "]")
+        clause_boundaries = [
+            "。", "；", ";",
+            "□适用", "□不适用",
+            "☑适用", "☑不适用",
+            "☒适用", "☒不适用",
+            "■适用", "■不适用",
+            "√适用", "√不适用",
+            "✔适用", "✔不适用",
+        ]
 
         k = float(r.get("k") or 0.1)
         cap = int(r.get("cap") or 30)
@@ -657,11 +701,53 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
                 label = f"={val:g}%"
 
             # Context: prefer the clause containing the *percentage* (more specific than phrase).
-            # IMPORTANT: clause boundaries are only 。！？；; (NOT commas), otherwise context gets cut too early.
+            # For CAGR-like growth descriptions, the useful content is usually within one clause bounded by
+            # 。 / ； / table markers like "□适用" and "不适用".
             abs_pct_idx = m.end() + pm.start()
-            ctx = _extract_sentence_around(text, abs_pct_idx, "。！？!?；;", max_len=1800)
-            if _looks_table_noise(ctx):
-                ctx = _extract_window_around(text, abs_pct_idx, window=220)
+            ctx = _extract_sentence_around(
+                text,
+                abs_pct_idx,
+                "。；;",
+                max_len=800,
+                boundary_chars_override=clause_boundaries,
+            )
+            if ctx:
+                # Trim common annual-report table markers so scoring context does not spill across
+                # lines like: "□适用 □不适用" or checked-box variants.
+                checkbox_prefixes = ["□", "☑", "☒", "■", "√", "✔"]
+
+                # Left side: if the extracted text still contains a tail marker like "□不适用",
+                # keep content after the last such marker.
+                left_markers = [f"{p}不适用" for p in checkbox_prefixes] + ["不适用"]
+                best_left_end = -1
+                for mk in left_markers:
+                    pos = ctx.rfind(mk)
+                    if pos >= 0:
+                        end_pos = pos + len(mk)
+                        if end_pos > best_left_end:
+                            best_left_end = end_pos
+                if best_left_end >= 0:
+                    ctx = ctx[best_left_end:].strip()
+
+                # Right side: stop before the next table marker, preferring explicit checkbox variants.
+                right_markers = (
+                    [f"{p}适用" for p in checkbox_prefixes]
+                    + [f"{p}不适用" for p in checkbox_prefixes]
+                    + ["适用", "不适用"]
+                )
+                cut_pos = -1
+                for mk in right_markers:
+                    pos = ctx.find(mk)
+                    if pos >= 0 and (cut_pos < 0 or pos < cut_pos):
+                        cut_pos = pos
+                if cut_pos >= 0:
+                    ctx = ctx[:cut_pos].strip()
+
+            # Be conservative when falling back to a short fixed window.
+            # Many normal annual-report narrative paragraphs contain several numbers/percentages,
+            # but they are still readable prose and should keep the full clause.
+            if _looks_table_noise(ctx) and len(ctx or "") > 600:
+                ctx = _extract_window_around(text, abs_pct_idx, window=260)
 
             # If the same sentence indicates cost/expense increase, treat it as negative.
             pol = "pos"
@@ -674,6 +760,11 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
                         break
 
             kw_label = f"{phrase}{label}"
+            norm_ctx = _normalize_cagr_context_for_dedupe(ctx)
+            dedupe_key = (kw_label, norm_ctx)
+            if dedupe_key in seen_exact:
+                continue
+            seen_exact.add(dedupe_key)
             total += pts
             if kw_label in agg:
                 agg_hit = agg[kw_label]
@@ -746,17 +837,33 @@ def score_text(text: str, keywords: Dict[str, Dict[str, int]]) -> Tuple[int, Lis
 
 
 def _merge_report_text(row: Dict[str, Any]) -> str:
-    parts = []
-    for k in (
+    """Merge report text for scoring.
+
+    Important:
+    - Prefer structured extracted sections first.
+    - Only fall back to full_mda when all structured sections are empty.
+
+    This avoids double-counting the same sentence when a paragraph appears both in a
+    structured field (e.g. main_business_section) and again inside full_mda.
+    """
+    parts: List[str] = []
+
+    structured_keys = (
         "chairman_letter",
         "industry_section",
         "main_business_section",
         "future_section",
-        "full_mda",
-    ):
+    )
+    for k in structured_keys:
         v = row.get(k)
         if isinstance(v, str) and v.strip():
             parts.append(v)
+
+    if not parts:
+        v = row.get("full_mda")
+        if isinstance(v, str) and v.strip():
+            parts.append(v)
+
     # Keep sections separated
     return "\n\n".join(parts)
 

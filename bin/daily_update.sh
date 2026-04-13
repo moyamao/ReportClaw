@@ -8,6 +8,7 @@ set -euo pipefail
 # 3) 再跑 daily_report.py；如果有新数据则生成文档并发邮件，没有新数据则自动跳过
 # 4) 不改写 conf/config.ini，避免影响你平时调试配置
 # 5) 运行 daily_report.py 时临时传入 [email] enabled=true 的覆盖配置
+# 6) 每次执行时自动预设下一次系统唤醒时间（07:55 / 20:55），减少长期开机需求
 #
 # 建议由 launchd / cron 在每天 08:00 和 21:00 调用本脚本。
 
@@ -28,6 +29,49 @@ LOCK_FILE="$LOCK_DIR/daily_update.lock"
 
 log() {
   echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"
+}
+
+schedule_next_wake() {
+  # 目标：让机器在下一次任务前 5 分钟唤醒，配合 launchd 的 08:00 / 21:00 任务执行。
+  # 规则：
+  #   - 当前时间早于 07:55 -> 设为今天 07:55
+  #   - 当前时间早于 20:55 -> 设为今天 20:55
+  #   - 否则 -> 设为明天 07:55
+  # 注意：
+  #   - 这里使用 `sudo -n`，要求本机已配置对 pmset 的免密码 sudo；否则只记录日志，不中断主任务。
+  #   - 对于已登录用户的“睡眠”场景最有效；若机器已关机且未自动登录，LaunchAgent 不会自行进入用户会话。
+  local next_wake
+  next_wake="$($VENV_PY - <<'PY'
+from datetime import datetime, timedelta
+
+now = datetime.now()
+slots = [
+    now.replace(hour=7, minute=55, second=0, microsecond=0),
+    now.replace(hour=20, minute=55, second=0, microsecond=0),
+]
+future = [x for x in slots if x > now]
+if future:
+    target = min(future)
+else:
+    target = (now + timedelta(days=1)).replace(hour=7, minute=55, second=0, microsecond=0)
+print(target.strftime('%m/%d/%y %H:%M:%S'))
+PY
+)"
+
+  if [ -z "$next_wake" ]; then
+    log "未能计算下一次唤醒时间，跳过 pmset 唤醒设置"
+    return 0
+  fi
+
+  if command -v pmset >/dev/null 2>&1; then
+    if sudo -n pmset schedule wakeorpoweron "$next_wake" >> "$LOG_FILE" 2>&1; then
+      log "已设置下一次系统唤醒时间：$next_wake"
+    else
+      log "设置系统唤醒时间失败（可能尚未配置 sudo 免密码执行 pmset）：$next_wake"
+    fi
+  else
+    log "系统未找到 pmset，跳过唤醒设置"
+  fi
 }
 
 cleanup() {
@@ -92,3 +136,4 @@ fi
 log "daily_report.py 执行完成"
 
 log "本次定时更新任务结束"
+schedule_next_wake

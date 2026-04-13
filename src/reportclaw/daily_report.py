@@ -21,31 +21,47 @@ ReportClaw - 每日年报摘录汇总（PDF 生成 + 邮件发送）
     host, port, use_ssl, timeout
     user, pass, from, to
   说明：to 支持多个收件人，逗号/分号/空格分隔。
+- [report] 可选：
+    summary_sort = score/time
+    score_only = true/false
+  说明：
+    - summary_sort 控制“摘要部分”的排序方式：
+        score = 按分数从高到低（默认）
+        time  = 按时间从新到旧
+    - score_only=true 时，只生成“打分 + 关键词命中明细”，不生成内容摘要部分。
+    - 命令行参数优先级高于 config.ini。
 
 用法
-1) 默认增量（推荐）：按 created_at 从 last_sent_iso 到 now 生成 PDF 并按配置发送
+1) 默认增量（推荐）：按 created_at 从 last_generated_iso 到 now 生成 PDF，并按配置决定是否发送邮件
     python src/reportclaw/daily_report.py
 
 2) 只生成不发邮件：
     python src/reportclaw/daily_report.py --no-email
 
-3) 仅发送邮件（假设 PDF 已生成）：
+3) 仅发送邮件（假设当天 PDF 已生成）：
     python src/reportclaw/daily_report.py --only-email
 
-4) 手工指定某个披露日（publish_date）生成（不影响 last_sent_at）：
+4) 手工指定某个披露日（publish_date）生成（不影响 last_sent_at / last_generated_iso）：
     python src/reportclaw/daily_report.py --date YYYY-MM-DD
 
-5) 忽略 last_sent_iso，仅取今天 00:00 到现在的入库记录：
+5) 忽略 last_generated_iso，仅取今天 00:00 到现在的入库记录：
     python src/reportclaw/daily_report.py --today-only
 
-6) 使用代理方式修改google sheet
+6) 只生成“打分 + 命中明细”，不生成摘要部分：
+    python src/reportclaw/daily_report.py --score-only
+
+7) 手工指定摘要部分排序：
+    python src/reportclaw/daily_report.py --summary-sort score
+    python src/reportclaw/daily_report.py --summary-sort time
+
+8) 使用代理方式运行并同步 Google Sheet：
 export HTTPS_PROXY=http://127.0.0.1:1092
 export HTTP_PROXY=http://127.0.0.1:1092
 export https_proxy=http://127.0.0.1:1092
 export http_proxy=http://127.0.0.1:1092
 PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report --no-email --date 2026-02-28
 
-7) 运行时临时覆盖邮件开关（不改写 config.ini）：
+9) 运行时临时覆盖邮件开关（不改写 config.ini）：
     python src/reportclaw/daily_report.py --email-enabled true
 
 输出
@@ -561,7 +577,84 @@ def _detect_score_hit_context_expr(conn) -> str:
         return "''"
 
 
+def _ensure_group_concat_max_len(conn, size: int = 1024 * 1024) -> None:
+    """Increase GROUP_CONCAT length for this session so score_hit_details is not truncated.
+
+    Without this, MySQL may truncate long keyword-context concatenations and the report may
+    show only a couple of hit-detail rows even when the total score is very high.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SET SESSION group_concat_max_len = {int(size)}")
+        cur.close()
+    except Exception:
+        pass
+
+
+def _parse_score_hit_detail_rows(r: dict, max_rows: int = 10, dedup: bool = True) -> list[dict]:
+    """Parse score_hit_details into deduplicated rows.
+
+    Input line format:
+      keyword|weight|hit_count|context
+
+    Dedup rule:
+    - Prefer de-duplicating by normalized context sentence, because the user reads the context.
+    - If the same normalized context appears multiple times, keep only the first (already sorted
+      by ABS(weight * hit_count) DESC in SQL).
+    """
+    raw = (r.get("score_hit_details") or "").strip()
+    if not raw:
+        return []
+
+    items: list[dict] = []
+    seen_ctx: set[str] = set()
+
+    for line in raw.split("\n"):
+        line = (line or "").strip()
+        if not line:
+            continue
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            continue
+
+        kw, w_s, cnt_s, ctx = parts
+        kw = (kw or "").strip()
+        if not kw:
+            continue
+
+        try:
+            w = int(str(w_s).strip())
+        except Exception:
+            w = 0
+        try:
+            cnt = int(str(cnt_s).strip())
+        except Exception:
+            cnt = 0
+
+        pts = w * cnt
+        ctx = (ctx or "").replace("\r", " ").replace("\n", " ").strip()
+        ctx = re.sub(r"[ \t]{2,}", " ", ctx)
+        norm_ctx = re.sub(r"\s+", "", ctx)
+
+        if dedup and norm_ctx:
+            if norm_ctx in seen_ctx:
+                continue
+            seen_ctx.add(norm_ctx)
+
+        items.append({
+            "keyword": kw,
+            "weight": w,
+            "hit_count": cnt,
+            "points": pts,
+            "context": ctx,
+        })
+        if len(items) >= max_rows:
+            break
+
+    return items
+
 def fetch_rows_by_publish_date(conn, publish_date: str):
+    _ensure_group_concat_max_len(conn)
     cur = conn.cursor(dictionary=True)
     ctx_expr = _detect_score_hit_context_expr(conn)
     cur.execute(
@@ -616,6 +709,7 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
     """
     Fetch rows where publish_date between [start_date, end_date] inclusive. Dates are YYYY-MM-DD.
     """
+    _ensure_group_concat_max_len(conn)
     cur = conn.cursor(dictionary=True)
     ctx_expr = _detect_score_hit_context_expr(conn)
     cur.execute(
@@ -669,6 +763,7 @@ def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
     """
     Fetch rows where annual_report_mda.created_at is in (start_ts, end_ts] (timestamps as strings 'YYYY-MM-DD HH:MM:SS').
     """
+    _ensure_group_concat_max_len(conn)
     cur = conn.cursor(dictionary=True)
     ctx_expr = _detect_score_hit_context_expr(conn)
     cur.execute(
@@ -1017,74 +1112,34 @@ def clean_text_for_reading(t: str) -> str:
     return "\n".join(paras).strip()
 
 
-def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
-    def _build_score_detail_table(r: dict, max_rows: int = 10):
-        """Build a small table: keyword(score) -> context sentence.
+def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sort: str = "score", score_only: bool = False) -> str:
+    def _build_score_detail_blocks(r: dict, max_rows: int = 10):
+        """Build split-friendly flowables for score hit details.
 
-        Expects r['score_hit_details'] formatted as lines:
-          keyword|weight|hit_count|context
+        Do NOT use a Table here: a single very long context inside one table cell cannot split
+        across pages and may raise ReportLab LayoutError.
         """
-        raw = (r.get("score_hit_details") or "").strip()
-        if not raw:
-            return None
+        detail_rows = _parse_score_hit_detail_rows(r, max_rows=max_rows, dedup=True)
+        if not detail_rows:
+            return []
 
-        rows: list[list] = []
-        for line in raw.split("\n"):
-            line = (line or "").strip()
-            if not line:
-                continue
-            parts = line.split("|", 3)
-            if len(parts) != 4:
-                continue
-            kw, w_s, cnt_s, ctx = parts
-            kw = (kw or "").strip()
-            if not kw:
-                continue
-            try:
-                w = int(str(w_s).strip())
-            except Exception:
-                w = 0
-            try:
-                cnt = int(str(cnt_s).strip())
-            except Exception:
-                cnt = 0
-            pts = w * cnt
-            # Keep full context sentence for the report; only normalize hard line breaks
-            # (context_sentence is expected to already be a single “sentence block” from report_scoring).
-            ctx = (ctx or "").replace("\r", " ").replace("\n", " ").strip()
-            # Avoid pathological whitespace without breaking punctuation
-            ctx = re.sub(r"[ \t]{2,}", " ", ctx)
+        blocks = [Paragraph("关键词命中明细", section_header), Spacer(1, 1.5 * mm)]
+        for idx, item in enumerate(detail_rows, start=1):
+            kw = item["keyword"]
+            pts = int(item["points"])
+            ctx = item["context"]
             sign = "+" if pts > 0 else ""
-            left = f"{kw}({sign}{pts})"
-            # Use Paragraph so long text wraps nicely
-            rows.append([
-                Paragraph(escape(left), pre),
-                Paragraph(escape(ctx) if ctx else "（无原文）", body),
-            ])
-            if len(rows) >= max_rows:
-                break
+            left = f"{idx}. {kw}({sign}{pts})"
 
-        if not rows:
-            return None
+            blocks.append(Paragraph(escape(left), pre))
+            blocks.append(Paragraph(escape(ctx) if ctx else "（无原文）", body))
+            if idx < len(detail_rows):
+                blocks.append(Spacer(1, 1.2 * mm))
+                blocks.append(Paragraph("────────", stock_footer))
+                blocks.append(Spacer(1, 1.2 * mm))
 
-        data = [[Paragraph("命中(分数)", pre), Paragraph("原文", pre)]] + rows
-        tbl = Table(data, colWidths=[45 * mm, None])
-        tbl.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                    ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.grey),
-                    ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-                    ("TOPPADDING", (0, 0), (-1, -1), 3),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ]
-            )
-        )
-        return tbl
+        blocks.append(Spacer(1, 2 * mm))
+        return blocks
     """
     将 rows（DB 查询结果）渲染为汇总 PDF。
 
@@ -1236,7 +1291,10 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
     story = []
 
     score_rows = [r for r in sort_rows_by_score_desc(rows) if _row_has_visible_score_entry(r)]
-    summary_rows = sort_rows_by_time_desc(rows)
+    if summary_sort == "time":
+        summary_rows = sort_rows_by_time_desc(rows)
+    else:
+        summary_rows = sort_rows_by_score_desc(rows)
 
     # Cover page placeholder
     story.append(Spacer(1, 260 * mm))
@@ -1348,10 +1406,9 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
             score_badge = format_score_badge(score_info, max_items=4)
             if score_badge:
                 story.append(Paragraph(escape(score_badge), score_line))
-        detail_tbl = _build_score_detail_table(r, max_rows=10)
-        if detail_tbl is not None:
-            story.append(detail_tbl)
-            story.append(Spacer(1, 2 * mm))
+        detail_blocks = _build_score_detail_blocks(r, max_rows=10)
+        if detail_blocks:
+            story.extend(detail_blocks)
         story.append(Spacer(1, 3 * mm))
         story.append(Paragraph("────────────────────────────────", stock_footer))
         story.append(Spacer(1, 4 * mm))
@@ -1361,10 +1418,14 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str) -> str:
         if i < len(score_rows) - 1:
             story.append(Spacer(1, 2 * mm))
 
+    if score_only:
+        doc.build(story, onFirstPage=_draw_cover)
+        return out_path
 
     if score_rows:
         story.append(PageBreak())
-    story.append(Paragraph("摘要部分（按时间从新到旧）", h1))
+    summary_title = "摘要部分（按时间从新到旧）" if summary_sort == "time" else "摘要部分（按分数从高到低）"
+    story.append(Paragraph(summary_title, h1))
     story.append(Spacer(1, 6 * mm))
 
     for i, r in enumerate(summary_rows):
@@ -1491,45 +1552,18 @@ def _text_to_xhtml_paras(t: str) -> str:
     return "\n".join(out) if out else "<p>（未提取到内容）</p>"
 
 
-def _score_details_to_xhtml(r: dict, max_rows: int = 20) -> str:
-    """Render score hit details for EPUB.
-
-    Input format in r['score_hit_details']:
-      keyword|weight|hit_count|context
-
-    We intentionally keep more rows than PDF and avoid truncating context aggressively,
-    because the user needs to inspect this section in EPUB.
-    """
-    raw = (r.get("score_hit_details") or "").strip()
-    if not raw:
+def _score_details_to_xhtml(r: dict, max_rows: int = 10) -> str:
+    """Render score hit details for EPUB using deduplicated top-N rows."""
+    detail_rows = _parse_score_hit_detail_rows(r, max_rows=max_rows, dedup=True)
+    if not detail_rows:
         return ""
 
     items: list[str] = []
-    count = 0
-    for line in raw.split("\n"):
-        line = (line or "").strip()
-        if not line:
-            continue
-        parts = line.split("|", 3)
-        if len(parts) != 4:
-            continue
-        kw, w_s, cnt_s, ctx = parts
-        kw = (kw or "").strip()
-        if not kw:
-            continue
-        try:
-            w = int(str(w_s).strip())
-        except Exception:
-            w = 0
-        try:
-            cnt = int(str(cnt_s).strip())
-        except Exception:
-            cnt = 0
-        pts = w * cnt
+    for item in detail_rows:
+        kw = item["keyword"]
+        pts = int(item["points"])
+        ctx = item["context"]
         sign = "+" if pts > 0 else ""
-
-        ctx = (ctx or "").replace("\r", " ").replace("\n", " ").strip()
-        ctx = re.sub(r"[ \t]{2,}", " ", ctx)
         ctx_html = _text_to_xhtml_paras(ctx) if ctx else "<p>（无原文）</p>"
 
         items.append(
@@ -1542,12 +1576,6 @@ def _score_details_to_xhtml(r: dict, max_rows: int = 20) -> str:
                 ]
             )
         )
-        count += 1
-        if count >= max_rows:
-            break
-
-    if not items:
-        return ""
 
     return "\n".join([
         "<h3>关键词命中明细</h3>",
@@ -1555,7 +1583,7 @@ def _score_details_to_xhtml(r: dict, max_rows: int = 20) -> str:
     ])
 
 
-def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
+def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_sort: str = "score", score_only: bool = False) -> str:
     """Generate a minimal EPUB2 (zip-based) alongside the PDF."""
     out_p = Path(out_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1567,7 +1595,10 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
     short_name = out_p.stem
 
     score_rows = [r for r in sort_rows_by_score_desc(rows) if _row_has_visible_score_entry(r)]
-    summary_rows = sort_rows_by_time_desc(rows)
+    if summary_sort == "time":
+        summary_rows = sort_rows_by_time_desc(rows)
+    else:
+        summary_rows = sort_rows_by_score_desc(rows)
 
     def make_header(r: dict) -> str:
         file_path = r.get("file_path", "") or ""
@@ -1750,50 +1781,17 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
 </navPoint>"""
         )
 
-    if not score_rows:
-        # keep score section empty when no company has visible score entries
-        pass
-    summary_idx = len(score_rows) + 1
-    summary_parts = [
-        "<h2>摘要部分（按时间从新到旧）</h2>",
-    ]
+    summary_start_idx = len(score_rows) + 1
+    summary_title = "摘要部分（按时间从新到旧）" if summary_sort == "time" else "摘要部分（按分数从高到低）"
 
-    for r in summary_rows:
-        header = make_header(r)
-        industry_line = make_industry_line(r)
-        full_mda = r.get("full_mda") or ""
-
-        biz = r.get("main_business_section") or ""
-        if (not str(biz).strip()) and full_mda:
-            biz = full_mda
-            if str(biz).startswith("[PARSE_FAILED]"):
-                parts2 = str(biz).split("\n", 1)
-                biz = parts2[1] if len(parts2) == 2 else ""
-
-        fut = r.get("future_section") or ""
-        chairman = str(r.get("chairman_letter") or "").strip()
-
-        summary_parts.append(f"<h3>{_escape_xhtml(header)}</h3>")
-        summary_parts.append(f"<p class=\"noindent industry\">{_escape_xhtml(industry_line)}</p>")
-        if chairman:
-            summary_parts += [
-                "<h4>董事长致辞 / 致股东(投资者)信</h4>",
-                _text_to_xhtml_paras(chairman),
-                "<hr class=\"divider\" />",
-            ]
-
-        summary_parts += [
-            "<h4>管理层综述（摘录）</h4>",
-            _text_to_xhtml_paras(str(biz)),
-            "<hr class=\"divider\" />",
-            "<h4>未来展望（摘录）</h4>",
-            _text_to_xhtml_paras(str(fut)),
-            "<p class='center' style='margin-top:1em;'>###########**end****############</p>",
-            "<p class=\"sep\">────────────────────────────────</p>",
-        ]
-
-    summary_body_html = "\n".join(summary_parts)
-    summary_xhtml = f"""<?xml version='1.0' encoding='utf-8'?>
+    if (not score_only) and summary_rows:
+        # Overview chapter for summary section
+        overview_idx = summary_start_idx
+        overview_body_html = "\n".join([
+            f"<h2>{_escape_xhtml(summary_title)}</h2>",
+            "<p class=\"noindent\">以下各公司分别独立成章，页头将显示公司代码、公司名与申万行业。</p>",
+        ])
+        overview_xhtml = f"""<?xml version='1.0' encoding='utf-8'?>
 <!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.1//EN'
   'http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd'>
 <html xmlns=\"http://www.w3.org/1999/xhtml\">
@@ -1804,33 +1802,101 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str) -> str:
   <style type=\"text/css\">
     body {{ font-family: serif; line-height: 1.7; margin: 0 0.9em; }}
     h2 {{ margin-top: 0.8em; font-size: 1.15em; }}
+    p {{ margin: 1.4em 0; text-indent: 2em; }}
+    p.noindent {{ text-indent: 0; }}
+  </style>
+</head>
+<body>
+{overview_body_html}
+</body>
+</html>
+"""
+        overview_fn = f"OEBPS/chap{overview_idx:03d}.xhtml"
+        xhtml_files[overview_fn] = overview_xhtml
+        overview_item_id = f"chap{overview_idx:03d}"
+        manifest_items.append((overview_item_id, f"chap{overview_idx:03d}.xhtml", "application/xhtml+xml"))
+        spine_items.append(overview_item_id)
+        navpoints.append(
+            f"""<navPoint id="navPoint-{overview_idx + play_order_base}" playOrder="{overview_idx + play_order_base}">
+          <navLabel><text>{_escape_xhtml(summary_title)}</text></navLabel>
+          <content src="chap{overview_idx:03d}.xhtml"/>
+        </navPoint>"""
+        )
+
+        # One summary chapter per company, so EPUB readers show company header instead of a generic page title
+        for j, r in enumerate(summary_rows, start=1):
+            chap_idx = summary_start_idx + j
+            header = make_header(r)
+            industry_line = make_industry_line(r)
+            full_mda = r.get("full_mda") or ""
+
+            biz = r.get("main_business_section") or ""
+            if (not str(biz).strip()) and full_mda:
+                biz = full_mda
+                if str(biz).startswith("[PARSE_FAILED]"):
+                    parts2 = str(biz).split("\n", 1)
+                    biz = parts2[1] if len(parts2) == 2 else ""
+
+            fut = r.get("future_section") or ""
+            chairman = str(r.get("chairman_letter") or "").strip()
+
+            company_parts = [
+                f"<h2>{_escape_xhtml(header)}</h2>",
+                f"<p class=\"noindent industry\">{_escape_xhtml(industry_line)}</p>",
+            ]
+            if chairman:
+                company_parts += [
+                    "<h3>董事长致辞 / 致股东(投资者)信</h3>",
+                    _text_to_xhtml_paras(chairman),
+                    "<hr class=\"divider\" />",
+                ]
+
+            company_parts += [
+                "<h3>管理层综述（摘录）</h3>",
+                _text_to_xhtml_paras(str(biz)),
+                "<hr class=\"divider\" />",
+                "<h3>未来展望（摘录）</h3>",
+                _text_to_xhtml_paras(str(fut)),
+                "<p class='center' style='margin-top:1em;'>###########**end****############</p>",
+            ]
+
+            company_body_html = "\n".join(company_parts)
+            company_xhtml = f"""<?xml version='1.0' encoding='utf-8'?>
+<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.1//EN'
+  'http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd'>
+<html xmlns=\"http://www.w3.org/1999/xhtml\">
+<head>
+  <title>{_escape_xhtml(r.get('stock_code',''))} {_escape_xhtml(r.get('stock_name',''))}</title>
+  <meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <style type=\"text/css\">
+    body {{ font-family: serif; line-height: 1.7; margin: 0 0.9em; }}
+    h2 {{ margin-top: 0.8em; font-size: 1.15em; }}
     h3 {{ margin-top: 1.0em; font-size: 1.05em; }}
-    h4 {{ margin-top: 0.9em; font-size: 1.0em; }}
     p {{ margin: 1.4em 0; text-indent: 2em; }}
     p.noindent {{ text-indent: 0; }}
     p.industry {{ margin: 0.5em 0 1.0em 0; color: #444; }}
     p.center {{ text-indent: 0; text-align: center; }}
-    p.sep {{ text-indent: 0; text-align: center; margin: 1.0em 0; letter-spacing: 0.08em; }}
     hr.divider {{ border: 0; border-top: 1px solid #999; margin: 1.2em 0; }}
   </style>
 </head>
 <body>
-{summary_body_html}
+{company_body_html}
 </body>
 </html>
 """
 
-    summary_fn = f"OEBPS/chap{summary_idx:03d}.xhtml"
-    xhtml_files[summary_fn] = summary_xhtml
-    summary_item_id = f"chap{summary_idx:03d}"
-    manifest_items.append((summary_item_id, f"chap{summary_idx:03d}.xhtml", "application/xhtml+xml"))
-    spine_items.append(summary_item_id)
-    navpoints.append(
-        f"""<navPoint id=\"navPoint-{summary_idx + play_order_base}\" playOrder=\"{summary_idx + play_order_base}\">
-  <navLabel><text>摘要部分（按时间从新到旧）</text></navLabel>
-  <content src=\"chap{summary_idx:03d}.xhtml\"/>
+            company_fn = f"OEBPS/chap{chap_idx:03d}.xhtml"
+            xhtml_files[company_fn] = company_xhtml
+            company_item_id = f"chap{chap_idx:03d}"
+            manifest_items.append((company_item_id, f"chap{chap_idx:03d}.xhtml", "application/xhtml+xml"))
+            spine_items.append(company_item_id)
+            navpoints.append(
+                f"""<navPoint id=\"navPoint-{chap_idx + play_order_base}\" playOrder=\"{chap_idx + play_order_base}\">
+  <navLabel><text>{_escape_xhtml(r.get('stock_code',''))} {_escape_xhtml(r.get('stock_name',''))}</text></navLabel>
+  <content src=\"chap{chap_idx:03d}.xhtml\"/>
 </navPoint>"""
-    )
+            )
 
     manifest_xml = "\n".join(
         [
@@ -2026,9 +2092,15 @@ def parse_args():
     p.add_argument("--no-email", action="store_true", help="Do not send email even if enabled in config.")
     p.add_argument("--only-email", action="store_true", help="Only send email (assumes PDF already generated).")
     p.add_argument("--config", default=str(CONF_DIR / "config.ini"), help="Path to config.ini (default: conf/config.ini)")
-    p.add_argument("--today-only", action="store_true", help="Force sending only today's created_at (ignore last_sent history).")
+    p.add_argument("--today-only", action="store_true",
+                   help="Force sending only today's created_at (ignore last_sent history).")
     p.add_argument("--epub", action="store_true", help="Also generate an EPUB alongside the PDF")
-    p.add_argument("--email-enabled", default=None, choices=["true", "false"], help="Temporarily override [email] enabled with true/false for this run only")
+    p.add_argument("--score-only", action="store_true",
+                   help="Only include the score section and score hit details; skip the summary extract section")
+    p.add_argument("--summary-sort", default=None, choices=["score", "time"],
+                   help="Summary section order: score or time. Default comes from [report] summary_sort, fallback=score")
+    p.add_argument("--email-enabled", default=None, choices=["true", "false"],
+                   help="Temporarily override [email] enabled with true/false for this run only")
     return p.parse_args()
 
 def load_config(path: str) -> configparser.ConfigParser:
@@ -2042,6 +2114,39 @@ def load_config(path: str) -> configparser.ConfigParser:
     cfg.read(p, encoding="utf-8")
     return cfg
 
+def resolve_summary_sort(cfg: configparser.ConfigParser, cli_value: str | None) -> str:
+    """Resolve summary section ordering for PDF/EPUB.
+
+    Priority:
+      1) CLI --summary-sort
+      2) [report] summary_sort in config.ini
+      3) default = score
+    """
+    if cli_value in ("score", "time"):
+        return cli_value
+
+    cfg_value = ""
+    if cfg is not None:
+        cfg_value = cfg.get("report", "summary_sort", fallback="").strip().lower()
+    if cfg_value in ("score", "time"):
+        return cfg_value
+
+    return "score"
+
+def resolve_score_only(cfg: configparser.ConfigParser, cli_value: bool) -> bool:
+    """Resolve whether to generate score section only.
+
+    Priority:
+      1) CLI --score-only
+      2) [report] score_only in config.ini
+      3) default = false
+    """
+    if cli_value:
+        return True
+    if cfg is None:
+        return False
+    return cfg.get("report", "score_only", fallback="false").strip().lower() in ("1", "true", "yes", "y")
+
 def main():
     """
     CLI 入口：
@@ -2051,6 +2156,8 @@ def main():
     """
     args = parse_args()
     cfg = load_config(args.config)
+    summary_sort = resolve_summary_sort(cfg, args.summary_sort)
+    score_only = resolve_score_only(cfg, args.score_only)
 
     now = dt.datetime.now()
     # 模式1：手工指定某个披露日（保持老逻辑）
@@ -2084,13 +2191,14 @@ def main():
                 return
 
             rows = sort_rows_by_score_desc(rows)
-            generate_daily_summary_pdf(rows, out_pdf, range_label)
-            print(f"已生成每日汇总PDF: {out_pdf}")
+            generate_daily_summary_pdf(rows, out_pdf, range_label, summary_sort=summary_sort, score_only=score_only)
+            print(f"已生成每日汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
             epub_enabled = args.epub or cfg.get("epub", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
             if epub_enabled:
                 out_epub = str(_pick_daily_epub_path_for_pdf(out_pdf))
-                generate_daily_summary_epub(rows, out_epub, range_label)
-                print(f"已生成每日汇总EPUB: {out_epub}")
+                generate_daily_summary_epub(rows, out_epub, range_label, summary_sort=summary_sort,
+                                            score_only=score_only)
+                print(f"已生成每日汇总EPUB: {out_epub} | summary_sort={summary_sort} | score_only={score_only}")
             # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
             try:
                 sync_rows_to_google_sheet_with_retry(cfg, rows, run_date=run_date)
@@ -2150,14 +2258,15 @@ def main():
                 return
 
             rows = sort_rows_by_score_desc(rows)
-            generate_daily_summary_pdf(rows, out_pdf, range_label)
-            print(f"已生成每日汇总PDF: {out_pdf}")
+            generate_daily_summary_pdf(rows, out_pdf, range_label, summary_sort=summary_sort, score_only=score_only)
+            print(f"已生成每日汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
             out_epub: str | None = None
             epub_enabled = args.epub or cfg.get("epub", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
             if epub_enabled:
                 out_epub = str(_pick_daily_epub_path_for_pdf(out_pdf))
-                generate_daily_summary_epub(rows, out_epub, range_label)
-                print(f"已生成每日汇总EPUB: {out_epub}")
+                generate_daily_summary_epub(rows, out_epub, range_label, summary_sort=summary_sort,
+                                            score_only=score_only)
+                print(f"已生成每日汇总EPUB: {out_epub} | summary_sort={summary_sort} | score_only={score_only}")
             # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
             try:
                 sync_rows_to_google_sheet_with_retry(cfg, rows, run_date=run_date)
@@ -2207,7 +2316,7 @@ if __name__ == "__main__":
     main()
 
 """
-config.ini email example:
+config.ini example:
 
 [email]
 enabled = true
@@ -2219,6 +2328,15 @@ from = your_email@gmail.com
 to = a@example.com,b@example.com
 use_ssl = false
 timeout = 30
+
+[report]
+summary_sort = score
+score_only = false
+
+说明：
+- summary_sort = score/time
+- score_only = true/false
+- 如果命令行传了 --summary-sort 或 --score-only，则命令行优先。
 
 Tip: Gmail requires an App Password (enable 2FA first).
 """
