@@ -2299,7 +2299,7 @@ def main():
 
         DAILY_DIR.mkdir(parents=True, exist_ok=True)
         file_date = now.strftime("%m%d")
-        base_name = f"AR_{file_date}_{stock_code}"
+        base_name = f"AR-{file_date}-{stock_code}"
         out_pdf = str(DAILY_DIR / f"{base_name}.pdf")
         out_epub: str | None = None
 
