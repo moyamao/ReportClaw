@@ -51,8 +51,10 @@ WHERE stock_code='000975' AND report_year=2025;
 DELETE FROM annual_report_mda;
 DELETE FROM annual_reports;
 """
+import argparse
 import os
 import re
+import sys
 import time
 import requests
 import pdfplumber
@@ -63,6 +65,7 @@ from datetime import datetime, timedelta
 import traceback
 import json
 import concurrent.futures
+import subprocess
 from typing import Any
 
 from pathlib import Path
@@ -83,6 +86,94 @@ DOWNLOADS_DIR = DATA_DIR / "downloads"
 DAILY_DIR = DATA_DIR / "report"
 STATE_DIR = DATA_DIR / "state"
 
+def parse_args():
+    """
+    命令行参数说明
+
+    用法一：全市场增量抓取（默认行为）
+        PYTHONPATH=src ./venv/bin/python -m reportclaw.mainM
+
+        说明：
+        - 不加 --single-company 时，按原有逻辑抓取全市场最近 N 天年报。
+        - N 由 config.ini 里的 [crawler].days_back 控制。
+        - 是否使用上次抓取时间做增量窗口，由 [crawler].use_last_crawl 控制。
+
+    用法二：单公司历史年报模式
+        PYTHONPATH=src ./venv/bin/python -m reportclaw.mainM --single-company --stock-code 000559 --years 10
+
+        说明：
+        - 加了 --single-company 后，只抓取单个公司的历史年报。
+        - --stock-code 可传 6 位股票代码；如果不传，默认使用 600519。
+        - --years 表示抓取最近多少个报告年度，默认 10。
+        - 单公司模式下，会强制关闭 use_last_crawl，并强制开启 reparse_existing。
+        - 单公司模式下，解析入库完成后，会自动调用 report_scoring.py 对本次写入的 report_id 逐个打分。
+
+    示例：
+        1) 全市场增量：
+           PYTHONPATH=src ./venv/bin/python -m reportclaw.mainM
+
+        2) 单公司（指定股票）：
+           PYTHONPATH=src ./venv/bin/python -m reportclaw.mainM --single-company --stock-code 000559 --years 10
+
+        3) 单公司（默认 600519）：
+           PYTHONPATH=src ./venv/bin/python -m reportclaw.mainM --single-company --years 10
+    """
+    p = argparse.ArgumentParser(description="抓取A股年报并解析MD&A入库")
+    p.add_argument("--single-company", action="store_true", help="启用单公司历史年报模式")
+    p.add_argument("--stock-code", default=None, help="指定单个A股公司代码（6位），单公司模式下默认 600519")
+    p.add_argument("--years", type=int, default=10, help="单公司模式下抓取最近多少个报告年度，默认10")
+    return p.parse_args()
+
+
+def _normalize_stock_code(stock_code: str | None) -> str | None:
+    if stock_code is None:
+        return None
+    s = str(stock_code).strip()
+    if not s:
+        return None
+    digits = re.sub(r"\D+", "", s)
+    if not digits:
+        return None
+    return digits.zfill(6)
+
+
+def _guess_cninfo_exchange(stock_code: str) -> tuple[str, str]:
+    code = str(stock_code).strip()
+    if code.startswith(("600", "601", "603", "605", "688", "689", "900")):
+        return "sse", "sh"
+    return "szse", "sz"
+
+
+def _score_reports_by_ids(report_ids: list[int]) -> None:
+    ids = []
+    seen = set()
+    for rid in report_ids:
+        try:
+            rid_i = int(rid)
+        except Exception:
+            continue
+        if rid_i in seen:
+            continue
+        seen.add(rid_i)
+        ids.append(rid_i)
+
+    if not ids:
+        return
+
+    scoring_script = PROJECT_ROOT / "src" / "reportclaw" / "report_scoring.py"
+    if not scoring_script.exists():
+        raise RuntimeError(f"未找到打分脚本: {scoring_script}")
+
+    env = os.environ.copy()
+    src_dir = str(PROJECT_ROOT / "src")
+    old_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = src_dir if not old_pythonpath else src_dir + os.pathsep + old_pythonpath
+
+    for rid in ids:
+        cmd = [sys.executable, str(scoring_script), "--report-id", str(rid)]
+        print(f"[score] start report_id={rid}")
+        subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env, check=True)
+        print(f"[score] done report_id={rid}")
 
 # ===============================
 # 增量抓取状态（避免重复爬取）
@@ -2517,12 +2608,35 @@ class AnnualReportParser:
 def main():
     """
     主流程（Orchestration）
-    1) 读取 crawler 配置（days_back）
+
+    默认模式：全市场增量抓取
+    1) 读取 crawler 配置（days_back / use_last_crawl / reparse_existing）
     2) 分别拉取深交所(szse)与上交所(sse)公告分页（只保留“年度报告全文”，排除摘要）
     3) 严格按时间窗口过滤（避免 seDate 失效导致拉到历史公告）
     4) 下载 PDF（若已存在则跳过下载），并做页数阈值过滤（<50 页视为非完整年报）
     5) 解析第三节管理层讨论与分析，入库 annual_reports + annual_report_mda
+
+    单公司模式：历史年报抓取 + 自动打分
+    - 通过 `--single-company` 启用。
+    - 通过 `--stock-code` 指定股票代码；不传时默认使用 600519。
+    - 通过 `--years` 指定最近多少个报告年度，默认 10。
+    - 单公司模式下会：
+      1) 关闭 use_last_crawl，避免历史年报被增量窗口截断；
+      2) 强制 reparse_existing=True，允许覆盖更新历史解析结果；
+      3) 仅抓取目标公司的最近 N 个报告年度年报；
+      4) 解析入库后，自动调用 report_scoring.py 对本次写入的 report_id 打分。
+
+    常用命令：
+    - 全市场增量：
+      PYTHONPATH=src ./venv/bin/python -m reportclaw.mainM
+
+    - 单公司（指定股票）：
+      PYTHONPATH=src ./venv/bin/python -m reportclaw.mainM --single-company --stock-code 000559 --years 10
+
+    - 单公司（默认 600519）：
+      PYTHONPATH=src ./venv/bin/python -m reportclaw.mainM --single-company --years 10
     """
+    args = parse_args()
     download_dir = str(DOWNLOADS_DIR)
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2537,8 +2651,15 @@ def main():
     cfg.read(CONF_DIR / "config.ini", encoding="utf-8")
     days_back = 30
     reparse_existing = True  # 默认允许覆盖更新，方便你迭代解析逻辑
-    use_last_crawl = True    # 新增：默认使用“上次抓取截止时间”做增量窗口，避免重复爬取
+    use_last_crawl = True  # 默认使用“上次抓取截止时间”做增量窗口，避免重复爬取
     last_crawl_state_file = LAST_CRAWL_STATE_FILE
+    company_mode = bool(getattr(args, "single_company", False))
+    stock_code_filter = _normalize_stock_code(args.stock_code) if company_mode else None
+    if company_mode and not stock_code_filter:
+        stock_code_filter = "600519"
+    company_years = max(1, int(args.years or 10))
+    current_year = datetime.now().year
+    min_report_year = current_year - company_years + 1
     try:
         if cfg.has_section("crawler") and cfg.get("crawler", "days_back", fallback=""):
             days_back = int(cfg.get("crawler", "days_back"))
@@ -2554,6 +2675,17 @@ def main():
         reparse_existing = True
         use_last_crawl = True
         last_crawl_state_file = LAST_CRAWL_STATE_FILE
+        company_mode = bool(getattr(args, "single_company", False))
+        stock_code_filter = _normalize_stock_code(args.stock_code) if company_mode else None
+        if company_mode and not stock_code_filter:
+            stock_code_filter = "600519"
+        company_years = max(1, int(args.years or 10))
+        current_year = datetime.now().year
+        min_report_year = current_year - company_years + 1
+
+    if company_mode:
+        use_last_crawl = False
+        reparse_existing = True
 
     # ===============================
     # 性能配置（并行下载/解析）
@@ -2587,7 +2719,10 @@ def main():
     # 注意：增量状态仍以 real_end_date（当前时间）持久化，避免把未来时间写入 last_crawl_end_iso。
     real_end_date = datetime.now()
     query_end_date = real_end_date + timedelta(days=1)
-    start_date = real_end_date - timedelta(days=days_back)
+    if company_mode:
+        start_date = datetime(min_report_year, 1, 1)
+    else:
+        start_date = real_end_date - timedelta(days=days_back)
 
     # 若启用增量窗口：start_date 取 max(days_back窗口起点, 上次抓取截止时间)
     if use_last_crawl:
@@ -2602,10 +2737,17 @@ def main():
     end_ts = query_end_date.timestamp()
 
     date_range = f"{start_date.strftime('%Y-%m-%d')}~{query_end_date.strftime('%Y-%m-%d')}"
-    if use_last_crawl:
-        print(f"[crawler] use_last_crawl=true, state={last_crawl_state_file}, window={date_range}")
-
-    columns = ["szse", "sse"]  # 全市场：深交所 + 上交所
+    if company_mode:
+        company_column, company_plate = _guess_cninfo_exchange(stock_code_filter)
+        columns = [company_column]
+        print(
+            f"[crawler] company_mode=true stock={stock_code_filter}, years={company_years}, "
+            f"report_year>={min_report_year}, window={date_range}, exchange={company_column}"
+        )
+    else:
+        if use_last_crawl:
+            print(f"[crawler] use_last_crawl=true, state={last_crawl_state_file}, window={date_range}")
+        columns = ["szse", "sse"]  # 全市场：深交所 + 上交所
 
     # 先收集候选年报（只收集元数据，不在分页循环里做重活）
     candidates: list[dict] = []
@@ -2613,7 +2755,7 @@ def main():
     for col in columns:
         page = 1
         while True:
-            plate = "sz" if col == "szse" else "sh"  # 深市/沪市
+            plate = company_plate if company_mode else ("sz" if col == "szse" else "sh")  # 深市/沪市
             print(f"[{col}] 拉取第 {page} 页...")
             data = {
                 "pageNum": page,
@@ -2624,7 +2766,7 @@ def main():
                 "category": "category_ndbg_szsh;",
                 "seDate": date_range,
                 "isHLtitle": "false",
-                "searchkey": "年度报告",
+                "searchkey": stock_code_filter if company_mode else "年度报告",
                 "secid": ""
             }
 
@@ -2714,9 +2856,18 @@ def main():
                         continue
                     year = int(m0.group(1))
 
+                if company_mode and year < min_report_year:
+                    continue
+
                 stock_code = ann.get("secCode")
                 stock_name = ann.get("secName")
                 timestamp = ann.get("announcementTime")
+
+                if stock_code is not None:
+                    stock_code = str(stock_code).strip().zfill(6)
+
+                if company_mode and stock_code != stock_code_filter:
+                    continue
 
                 if not stock_code or not stock_name or not timestamp:
                     continue
@@ -2861,6 +3012,7 @@ def main():
     # 主线程写库（避免多进程共享 DB 连接）
     # 按披露时间从新到旧写入，便于你查看日志
     parse_results.sort(key=lambda x: (x[0].get("ts") or 0), reverse=True)
+    written_report_ids: list[int] = []
     for c, res in parse_results:
         col = c.get("col")
         stock_code = c["stock_code"]
@@ -2882,6 +3034,7 @@ def main():
             industry_info=industry_info,
         )
         db.insert_mda(report_id, res.get("mda") or {})
+        written_report_ids.append(int(report_id))
 
         if res.get("ok"):
             print(f"完成：{tag} ({col}) elapsed={elapsed:.2f}s")
@@ -2909,6 +3062,13 @@ def main():
         very_slow = [r for r in perf_rows if r[0] >= 120]
         if very_slow:
             print(f"[perf] WARNING: {len(very_slow)} PDFs took >=120s to parse")
+
+        if company_mode:
+            try:
+                _score_reports_by_ids(written_report_ids)
+            except Exception as e:
+                print(f"[score] 公司历史年报打分失败: {e}")
+                raise
 
     # 写入本次抓取的截止时间（用于下次增量）；解析已并行化但截止时间仍以本次运行结束时刻为准
     if use_last_crawl:

@@ -64,6 +64,13 @@ PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report --no-email --date 20
 9) 运行时临时覆盖邮件开关（不改写 config.ini）：
     python src/reportclaw/daily_report.py --email-enabled true
 
+10) 只生成单个公司多年的打分和摘要（不受 date / today-only / 增量窗口限制）：
+    python src/reportclaw/daily_report.py --stock-code 300750 --no-email
+
+输出（单公司模式）
+- PDF：data/report/AR_<MMDD>_<code>.pdf
+- EPUB：data/report/AR_<MMDD>_<code>.epub
+
 输出
 - PDF：data/report/annual_report_summary_YYYY-MM-DD.pdf
 - 状态：data/state/last_sent.json
@@ -759,6 +766,62 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
     return rows or []
 
 
+def fetch_rows_by_stock_code(conn, stock_code: str):
+    """Fetch all available annual report rows for one stock code across multiple years.
+
+    Ordered by report_year DESC, then publish_date DESC.
+    """
+    _ensure_group_concat_max_len(conn)
+    cur = conn.cursor(dictionary=True)
+    ctx_expr = _detect_score_hit_context_expr(conn)
+    cur.execute(
+        f"""
+        SELECT
+          r.id AS report_id,
+          r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
+          r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
+          r.sw_l1_name AS sw_industry1,
+          r.sw_l2_name AS sw_industry2,
+          r.sw_l3_name AS sw_industry3,
+          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
+          m.created_at,
+          (
+            SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_total,
+          (
+            SELECT GROUP_CONCAT(
+              CONCAT(h.keyword, '(', h.hit_count, ')')
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '；'
+            )
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_hits,
+          (
+            SELECT GROUP_CONCAT(
+              CONCAT(
+                h.keyword, '|', h.weight, '|', h.hit_count, '|',
+                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
+              )
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '\n'
+            )
+            FROM annual_report_score_hits h
+            WHERE h.report_id = r.id
+          ) AS score_hit_details
+        FROM annual_reports r
+        JOIN annual_report_mda m ON m.report_id = r.id
+        WHERE r.stock_code = %s
+        ORDER BY r.report_year DESC, r.publish_date DESC, r.stock_code ASC
+        """,
+        (stock_code,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return rows or []
+
 def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
     """
     Fetch rows where annual_report_mda.created_at is in (start_ts, end_ts] (timestamps as strings 'YYYY-MM-DD HH:MM:SS').
@@ -904,6 +967,39 @@ def sort_rows_by_time_desc(rows: list[dict]) -> list[dict]:
     )
     return rows
 
+# --- Helper: sort rows by report_year DESC for single-stock multi-year reports ---
+def sort_rows_by_report_year_desc(rows: list[dict]) -> list[dict]:
+    """Sort rows for single-stock multi-year reports.
+
+    Order: report_year DESC, publish_date DESC, stock_code ASC.
+    """
+    rows = list(rows or [])
+
+    def _year(v) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return -10**9
+
+    def _date(v) -> str:
+        return str(v).strip() if v is not None else ""
+
+    rows.sort(
+        key=lambda r: (
+            _year(r.get("report_year")),
+            _date(r.get("publish_date")),
+            str(r.get("stock_code", "")),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+# Helper: group label for report year
+def _group_year_label(v) -> str:
+    """Return displayable report year label for grouping, fallback to '未知年份'."""
+    s = str(v).strip() if v is not None else ""
+    return s if s else "未知年份"
 
 # Helper: whether a row should be visible in the score section
 def _row_has_visible_score_entry(r: dict) -> bool:
@@ -1112,7 +1208,7 @@ def clean_text_for_reading(t: str) -> str:
     return "\n".join(paras).strip()
 
 
-def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sort: str = "score", score_only: bool = False) -> str:
+def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sort: str = "score", score_only: bool = False, single_stock_mode: bool = False) -> str:
     def _build_score_detail_blocks(r: dict, max_rows: int = 10):
         """Build split-friendly flowables for score hit details.
 
@@ -1290,11 +1386,16 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
 
     story = []
 
-    score_rows = [r for r in sort_rows_by_score_desc(rows) if _row_has_visible_score_entry(r)]
-    if summary_sort == "time":
-        summary_rows = sort_rows_by_time_desc(rows)
+    if single_stock_mode:
+        ordered_rows = sort_rows_by_report_year_desc(rows)
+        score_rows = [r for r in ordered_rows if _row_has_visible_score_entry(r)]
+        summary_rows = ordered_rows
     else:
-        summary_rows = sort_rows_by_score_desc(rows)
+        score_rows = [r for r in sort_rows_by_score_desc(rows) if _row_has_visible_score_entry(r)]
+        if summary_sort == "time":
+            summary_rows = sort_rows_by_time_desc(rows)
+        else:
+            summary_rows = sort_rows_by_score_desc(rows)
 
     # Cover page placeholder
     story.append(Spacer(1, 260 * mm))
@@ -1359,7 +1460,13 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
         html = "<br/>".join(html_lines)
         return Paragraph(html, body)
 
+    last_score_year = None
     for i, r in enumerate(score_rows):
+        cur_score_year = _group_year_label(r.get("report_year"))
+        if cur_score_year != last_score_year:
+            story.append(Paragraph(f"{cur_score_year}年", section_header))
+            story.append(Spacer(1, 2 * mm))
+            last_score_year = cur_score_year
         file_path = r.get("file_path", "") or ""
         pdf_name = ""
         try:
@@ -1583,7 +1690,7 @@ def _score_details_to_xhtml(r: dict, max_rows: int = 10) -> str:
     ])
 
 
-def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_sort: str = "score", score_only: bool = False) -> str:
+def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_sort: str = "score", score_only: bool = False, single_stock_mode: bool = False) -> str:
     """Generate a minimal EPUB2 (zip-based) alongside the PDF."""
     out_p = Path(out_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
@@ -1594,11 +1701,16 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
     # Use output filename stem as the short book name, e.g. AR-0319
     short_name = out_p.stem
 
-    score_rows = [r for r in sort_rows_by_score_desc(rows) if _row_has_visible_score_entry(r)]
-    if summary_sort == "time":
-        summary_rows = sort_rows_by_time_desc(rows)
+    if single_stock_mode:
+        ordered_rows = sort_rows_by_report_year_desc(rows)
+        score_rows = [r for r in ordered_rows if _row_has_visible_score_entry(r)]
+        summary_rows = ordered_rows
     else:
-        summary_rows = sort_rows_by_score_desc(rows)
+        score_rows = [r for r in sort_rows_by_score_desc(rows) if _row_has_visible_score_entry(r)]
+        if summary_sort == "time":
+            summary_rows = sort_rows_by_time_desc(rows)
+        else:
+            summary_rows = sort_rows_by_score_desc(rows)
 
     def make_header(r: dict) -> str:
         file_path = r.get("file_path", "") or ""
@@ -1688,6 +1800,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
     # Load scoring rules once for all rows
     good_rules, bad_rules = _load_scoring_rules(configparser.ConfigParser())
 
+    last_score_year = None
     for idx, r in enumerate(score_rows, start=1):
         header = make_header(r)
         industry_line = make_industry_line(r)
@@ -1705,7 +1818,12 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
         chairman = r.get("chairman_letter") or ""
         chairman = str(chairman).strip()
 
-        parts = [
+        parts = []
+        cur_score_year = _group_year_label(r.get("report_year"))
+        if cur_score_year != last_score_year:
+            parts.append(f"<h3>{_escape_xhtml(cur_score_year)}年</h3>")
+            last_score_year = cur_score_year
+        parts += [
             f"<h2>{_escape_xhtml(header)}</h2>",
             f"<p class=\"noindent industry\">{_escape_xhtml(industry_line)}</p>",
             "<h3>好坏词分数</h3>",
@@ -2101,6 +2219,8 @@ def parse_args():
                    help="Summary section order: score or time. Default comes from [report] summary_sort, fallback=score")
     p.add_argument("--email-enabled", default=None, choices=["true", "false"],
                    help="Temporarily override [email] enabled with true/false for this run only")
+    p.add_argument("--stock-code", default=None,
+                   help="Generate report for one stock code across multiple years, e.g. 300750")
     return p.parse_args()
 
 def load_config(path: str) -> configparser.ConfigParser:
@@ -2158,6 +2278,80 @@ def main():
     cfg = load_config(args.config)
     summary_sort = resolve_summary_sort(cfg, args.summary_sort)
     score_only = resolve_score_only(cfg, args.score_only)
+    now = dt.datetime.now()
+
+    # Single-stock multi-year mode: ignore date/today-only/incremental window and only generate one company's report.
+    if args.stock_code:
+        stock_code = str(args.stock_code).strip()
+        conn = mysql_connect(cfg)
+        try:
+            rows = fetch_rows_by_stock_code(conn, stock_code)
+        finally:
+            conn.close()
+
+        if not rows:
+            print(f"未找到股票 {stock_code} 的年报记录，不生成汇总文件")
+            return
+
+        rows = sort_rows_by_report_year_desc(rows)
+        stock_name = str(rows[0].get("stock_name") or "").strip()
+        title_label = f"{stock_code} {stock_name}".strip()
+
+        DAILY_DIR.mkdir(parents=True, exist_ok=True)
+        file_date = now.strftime("%m%d")
+        base_name = f"AR_{file_date}_{stock_code}"
+        out_pdf = str(DAILY_DIR / f"{base_name}.pdf")
+        out_epub: str | None = None
+
+        generate_daily_summary_pdf(
+            rows,
+            out_pdf,
+            title_label,
+            summary_sort=summary_sort,
+            score_only=score_only,
+            single_stock_mode=True,
+        )
+        print(f"已生成单公司多年份汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
+
+        epub_enabled = args.epub or cfg.get("epub", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
+        if epub_enabled:
+            out_epub = str(DAILY_DIR / f"{base_name}.epub")
+            generate_daily_summary_epub(
+                rows,
+                out_epub,
+                title_label,
+                summary_sort=summary_sort,
+                score_only=score_only,
+                single_stock_mode=True,
+            )
+            print(f"已生成单公司多年份汇总EPUB: {out_epub} | summary_sort={summary_sort} | score_only={score_only}")
+
+        enabled = cfg.get("email", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
+        if args.email_enabled is not None:
+            enabled = str(args.email_enabled).lower() == "true"
+        if args.no_email:
+            enabled = False
+
+        if enabled:
+            to_raw = cfg.get("email", "to", fallback="")
+            to_list = []
+            for part in to_raw.replace(";", ",").replace(" ", ",").split(","):
+                part = part.strip()
+                if part:
+                    to_list.append(part)
+
+            if not to_list:
+                print("邮箱发送已启用，但未配置 email.to，跳过发送")
+                return
+
+            to_addr = ", ".join(to_list)
+            subject = f"单公司多年年报汇总 {title_label}"
+            body = f"附件为 {title_label} 的多年年报打分与摘要汇总。"
+            send_email_with_attachment_smtp(cfg, to_addr, subject, body, out_pdf, out_epub)
+            print(f"已发送邮件到: {to_addr}")
+        else:
+            print("邮件发送未启用（email.enabled=false 或使用了 --no-email）")
+        return
 
     now = dt.datetime.now()
     # 模式1：手工指定某个披露日（保持老逻辑）

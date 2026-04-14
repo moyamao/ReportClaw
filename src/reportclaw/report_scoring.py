@@ -93,8 +93,17 @@ DEFAULT_CAGR_RULE: Dict[str, Any] = {
     "window_chars": 220,
     # Stop scanning at real sentence-ending punctuation only; do NOT stop at line-wrap newlines.
     "stop_chars": "。！？!?；;",
-    # If the extracted sentence contains any of these words, flip the score to negative (e.g., costs/expenses up)
+    # If the extracted sentence contains any of these words, this CAGR hit becomes neutral (0 points).
+    # The hit must still be written to DB, so downstream analysis can observe industry/company trends.
+    "neutralize_if_contains": [],
+    # If the extracted sentence contains any of these words, this CAGR hit becomes a discounted negative hit.
+    # Example: original +8 -> -4 when ratio=0.5.
     "negate_if_contains": ["成本", "费用"],
+    # If the extracted sentence contains any of these words, this CAGR hit becomes a full negative hit.
+    # Example: original +8 -> -8.
+    "full_negate_if_contains": [],
+    # Discount ratio used by negate_if_contains.
+    "negate_penalty_ratio": 0.5,
     # thresholds example:
     #   "thresholds": [{"ge": 20, "score": 2}, {"ge": 50, "score": 5}, ...]
 }
@@ -598,7 +607,12 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
     - Score by:
         mode=linear: score = floor(pct * k), then apply cap/min_pct
         mode=thresholds: pick the largest threshold ge <= pct and use its score
-    - Each hit is recorded as a synthetic positive Hit so it can be displayed.
+    - Every CAGR hit is preserved and written to DB so downstream analysis can observe
+      company / industry trend sentences even when they are neutralized or negated.
+    - Context post-processing priority:
+        1) neutralize_if_contains   -> 0分
+        2) negate_if_contains       -> 折扣负分（默认 0.5）
+        3) full_negate_if_contains  -> 全额负分
     """
     if not text:
         return 0, []
@@ -638,12 +652,33 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
         cap = int(r.get("cap") or 30)
         min_pct = float(r.get("min_pct") or 0)
 
-        # If CAGR phrase is in a "negative" sentence (e.g., cost/expense increase), we can flip the score.
-        # Config: negate_if_contains: ["成本","费用",...]
+        # Context-based post-processing for CAGR hits.
+        # Important: all同比增长命中都要保留并写库，便于后续观察行业/公司趋势。
+        # Scoring priority is:
+        # 1) neutralize_if_contains   -> 0分，但保留命中
+        # 2) negate_if_contains       -> 按折扣系数记负分（默认 0.5）
+        # 3) full_negate_if_contains  -> 按原始分值记全额负分
+        neutralize_if_contains = r.get("neutralize_if_contains", [])
+        if not isinstance(neutralize_if_contains, list):
+            neutralize_if_contains = []
+        neutralize_if_contains = [str(x) for x in neutralize_if_contains if str(x).strip()]
+
         negate_if_contains = r.get("negate_if_contains", ["成本", "费用"])
         if not isinstance(negate_if_contains, list):
             negate_if_contains = ["成本", "费用"]
         negate_if_contains = [str(x) for x in negate_if_contains if str(x).strip()]
+
+        full_negate_if_contains = r.get("full_negate_if_contains", [])
+        if not isinstance(full_negate_if_contains, list):
+            full_negate_if_contains = []
+        full_negate_if_contains = [str(x) for x in full_negate_if_contains if str(x).strip()]
+
+        try:
+            negate_penalty_ratio = float(r.get("negate_penalty_ratio", 0.5))
+        except Exception:
+            negate_penalty_ratio = 0.5
+        if negate_penalty_ratio <= 0:
+            negate_penalty_ratio = 0.5
 
         # thresholds mode support
         thr_list: List[Tuple[float, int]] = []
@@ -688,6 +723,7 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
                     continue
                 ge_txt = str(int(best_ge)) if float(best_ge).is_integer() else str(best_ge)
                 pts = best_sc
+                base_pts = pts
                 label = f">={ge_txt}%"
             else:
                 # linear
@@ -698,6 +734,7 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
                     continue
                 if pts > cap:
                     pts = cap
+                base_pts = pts
                 label = f"={val:g}%"
 
             # Context: prefer the clause containing the *percentage* (more specific than phrase).
@@ -749,17 +786,42 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
             if _looks_table_noise(ctx) and len(ctx or "") > 600:
                 ctx = _extract_window_around(text, abs_pct_idx, window=260)
 
-            # If the same sentence indicates cost/expense increase, treat it as negative.
+            # Apply context-based adjustments in this order.
+            # All CAGR hits are preserved for DB analysis; only the score changes.
+            # 1) neutralize  -> 0分
+            # 2) negate      -> 折扣负分（默认 0.5）
+            # 3) full negate -> 全额负分
             pol = "pos"
-            if ctx and negate_if_contains:
-                compact_ctx = re.sub(r"\s+", "", ctx)
+            compact_ctx = re.sub(r"\s+", "", ctx or "")
+
+            if compact_ctx and neutralize_if_contains:
+                for bad in neutralize_if_contains:
+                    if bad and bad in compact_ctx:
+                        pts = 0
+                        pol = "pos"
+                        break
+
+            if pts != 0 and compact_ctx and negate_if_contains:
                 for bad in negate_if_contains:
                     if bad and bad in compact_ctx:
-                        pts = -abs(int(pts))
+                        pts = -max(1, int(abs(pts) * negate_penalty_ratio))
+                        pol = "neg"
+                        break
+
+            if pts != 0 and compact_ctx and full_negate_if_contains:
+                for bad in full_negate_if_contains:
+                    if bad and bad in compact_ctx:
+                        pts = -abs(int(base_pts))
                         pol = "neg"
                         break
 
             kw_label = f"{phrase}{label}"
+            if pts == 0:
+                kw_label = f"{kw_label}[neutral]"
+            elif pts < 0 and abs(int(pts)) < abs(int(base_pts)):
+                kw_label = f"{kw_label}[negated]"
+            elif pts < 0 and abs(int(pts)) >= abs(int(base_pts)):
+                kw_label = f"{kw_label}[full_negated]"
             norm_ctx = _normalize_cagr_context_for_dedupe(ctx)
             dedupe_key = (kw_label, norm_ctx)
             if dedupe_key in seen_exact:
@@ -769,10 +831,11 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
             if kw_label in agg:
                 agg_hit = agg[kw_label]
                 agg_hit.count += 1
-                # If this occurrence flips polarity (e.g., cost/expense context), keep the stronger negative weight.
-                if pol == "neg" and agg_hit.polarity != "neg":
-                    agg_hit.polarity = "neg"
+                # For repeated CAGR labels, keep the strongest absolute weight and prefer negative polarity when present.
+                if abs(int(pts)) > abs(int(agg_hit.weight)):
                     agg_hit.weight = pts
+                if pol == "neg":
+                    agg_hit.polarity = "neg"
                 # Do NOT concatenate multiple contexts for CAGR hits; it quickly becomes unreadable
                 # (and often duplicates the same long sentence).
                 if not (agg_hit.context_sentence or agg_hit.context):
