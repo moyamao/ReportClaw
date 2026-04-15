@@ -137,7 +137,7 @@ def sync_rows_to_google_sheet_with_retry(cfg, rows, run_date, max_attempts: int 
         raise last_err
 
 # --- Scoring helpers (keyword-based) ---
-# Rules are loaded from conf/score_keywords.json (preferred) or from [scoring] section in config.ini.
+# Rules are loaded from conf/scoring_keywords.json (preferred) or from [scoring] section in config.ini.
 # JSON format example:
 # {
 #   "good": {"0到1": 3, "改善": 2},
@@ -148,13 +148,13 @@ def _load_scoring_rules(cfg: configparser.ConfigParser) -> tuple[dict[str, int],
     """Return (good_rules, bad_rules) where values are signed ints.
 
     Priority:
-      1) conf/score_keywords.json
+      1) conf/scoring_keywords.json
       2) config.ini [scoring] good_keywords / bad_keywords (comma-separated: kw:score)
     """
     good: dict[str, int] = {}
     bad: dict[str, int] = {}
 
-    json_path = CONF_DIR / "score_keywords.json"
+    json_path = CONF_DIR / "scoring_keywords.json"
     if json_path.exists():
         try:
             obj = json.loads(json_path.read_text(encoding="utf-8"))
@@ -995,11 +995,160 @@ def sort_rows_by_report_year_desc(rows: list[dict]) -> list[dict]:
     return rows
 
 
+
 # Helper: group label for report year
 def _group_year_label(v) -> str:
     """Return displayable report year label for grouping, fallback to '未知年份'."""
     s = str(v).strip() if v is not None else ""
     return s if s else "未知年份"
+
+
+def keep_latest_report_per_stock(rows: list[dict]) -> list[dict]:
+    """For normal daily/all modes, keep only the latest annual report per stock_code.
+
+    Reason:
+    - The database may contain historical reports (e.g. 2023/2024) for the same stock.
+    - In non-single-stock mode, the user only wants the newest available annual report
+      summary for each stock to appear in the generated file.
+
+    Rule for "latest":
+      1) report_year DESC
+      2) publish_date DESC
+      3) created_at DESC
+      4) report_id DESC
+    """
+    rows = list(rows or [])
+    if not rows:
+        return []
+
+    def _year(v) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return -10**9
+
+    def _dt(v):
+        if v is None:
+            return dt.datetime.min
+        if isinstance(v, dt.datetime):
+            return v
+        s = str(v).strip()
+        if not s:
+            return dt.datetime.min
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return dt.datetime.strptime(s, fmt)
+            except Exception:
+                pass
+        try:
+            return dt.datetime.fromisoformat(s)
+        except Exception:
+            return dt.datetime.min
+
+    best_by_code: dict[str, dict] = {}
+    for r in rows:
+        code = str(r.get("stock_code") or "").strip()
+        if not code:
+            continue
+
+        cur_key = (
+            _year(r.get("report_year")),
+            _dt(r.get("publish_date")),
+            _dt(r.get("created_at")),
+            int(r.get("report_id") or 0),
+        )
+
+        old = best_by_code.get(code)
+        if old is None:
+            best_by_code[code] = r
+            continue
+
+        old_key = (
+            _year(old.get("report_year")),
+            _dt(old.get("publish_date")),
+            _dt(old.get("created_at")),
+            int(old.get("report_id") or 0),
+        )
+        if cur_key > old_key:
+            best_by_code[code] = r
+
+    return list(best_by_code.values())
+
+
+# --- Helper: filter rows to globally latest reports for each stock_code ---
+def filter_rows_to_globally_latest_reports(conn, rows: list[dict]) -> list[dict]:
+    """Keep only rows that are the globally latest annual report for each stock_code.
+
+    Why this is needed:
+    - Incremental/all mode fetches by created_at window.
+    - If the user later backfills historical reports for one stock (e.g. 2023/2024), those old reports
+      get a *new* created_at and will re-enter today's incremental window.
+    - We only want a stock to appear in the all-stock daily file when the row itself is that stock's
+      newest annual report in the whole database, not merely the newest inside today's window.
+
+    Rule for global latest:
+      1) report_year DESC
+      2) publish_date DESC
+      3) created_at DESC
+      4) report_id DESC
+    """
+    rows = list(rows or [])
+    if not rows:
+        return []
+
+    codes = []
+    seen = set()
+    for r in rows:
+        code = str(r.get("stock_code") or "").strip()
+        if code and code not in seen:
+            seen.add(code)
+            codes.append(code)
+    if not codes:
+        return []
+
+    placeholders = ",".join(["%s"] * len(codes))
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            f"""
+            SELECT t.stock_code, t.report_id
+            FROM (
+                SELECT
+                    r.stock_code,
+                    r.id AS report_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY r.stock_code
+                        ORDER BY
+                            COALESCE(r.report_year, -999999) DESC,
+                            COALESCE(r.publish_date, '1000-01-01') DESC,
+                            COALESCE(m.created_at, '1000-01-01 00:00:00') DESC,
+                            r.id DESC
+                    ) AS rn
+                FROM annual_reports r
+                JOIN annual_report_mda m ON m.report_id = r.id
+                WHERE r.stock_code IN ({placeholders})
+            ) t
+            WHERE t.rn = 1
+            """,
+            tuple(codes),
+        )
+        latest_rows = cur.fetchall() or []
+    finally:
+        cur.close()
+
+    latest_id_by_code = {
+        str(x.get("stock_code") or "").strip(): int(x.get("report_id") or 0)
+        for x in latest_rows
+        if str(x.get("stock_code") or "").strip()
+    }
+
+    out = []
+    for r in rows:
+        code = str(r.get("stock_code") or "").strip()
+        rid = int(r.get("report_id") or 0)
+        if code and rid and latest_id_by_code.get(code) == rid:
+            out.append(r)
+    return out
 
 # Helper: whether a row should be visible in the score section
 def _row_has_visible_score_entry(r: dict) -> bool:
@@ -1254,7 +1403,7 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
     """
     styles = getSampleStyleSheet()
     base_font = _ensure_chinese_font(styles)
-    # Load scoring rules from conf/score_keywords.json or config.ini [scoring]
+    # Load scoring rules from conf/scoring_keywords.json or config.ini [scoring]
     # Note: PDF generator does not receive cfg, so it reads the JSON file (preferred).
     good_rules, bad_rules = _load_scoring_rules(configparser.ConfigParser())
 
@@ -2377,13 +2526,19 @@ def main():
             conn = mysql_connect(cfg)
             try:
                 rows = fetch_rows_by_publish_date(conn, day)
+
+                if not rows:
+                    print(f"{day} 无披露年报记录，不生成汇总PDF")
+                    return
+
+                rows = keep_latest_report_per_stock(rows)
+                rows = filter_rows_to_globally_latest_reports(conn, rows)
             finally:
                 conn.close()
 
             if not rows:
-                print(f"{day} 无披露年报记录，不生成汇总PDF")
+                print(f"{day} 新增的记录都不是各股票当前最新年报，不生成汇总PDF")
                 return
-
             rows = sort_rows_by_score_desc(rows)
             generate_daily_summary_pdf(rows, out_pdf, range_label, summary_sort=summary_sort, score_only=score_only)
             print(f"已生成每日汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
@@ -2443,14 +2598,20 @@ def main():
             conn = mysql_connect(cfg)
             try:
                 rows = fetch_rows_by_created_at_range(conn, start_ts, end_ts)
+
+                if not rows:
+                    print(f"{range_label} 无新增入库年报记录，不生成汇总PDF")
+                    # 不推进 last_generated_iso：避免出现“后续补入库但 created_at 落在旧窗口内”而被永远跳过。
+                    return
+
+                rows = keep_latest_report_per_stock(rows)
+                rows = filter_rows_to_globally_latest_reports(conn, rows)
             finally:
                 conn.close()
 
             if not rows:
-                print(f"{range_label} 无新增入库年报记录，不生成汇总PDF")
-                # 不推进 last_generated_iso：避免出现“后续补入库但 created_at 落在旧窗口内”而被永远跳过。
+                print(f"{range_label} 新增入库记录都不是各股票当前最新年报，不生成汇总PDF")
                 return
-
             rows = sort_rows_by_score_desc(rows)
             generate_daily_summary_pdf(rows, out_pdf, range_label, summary_sort=summary_sort, score_only=score_only)
             print(f"已生成每日汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
