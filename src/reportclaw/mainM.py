@@ -357,6 +357,7 @@ class JoinQuantIndustryClient:
         self.enabled = False
         self._cache = {}
         self._logged_disabled_reason = False
+        self._permission_cutoff_date = None
 
         if not JQDATA_AVAILABLE:
             self._log_disabled_once("[jqdata] jqdatasdk 未安装，跳过聚宽行业同步")
@@ -455,18 +456,25 @@ class JoinQuantIndustryClient:
         used_date = requested_date
         fallback_used = False
         fallback_from = None
+        permission_cutoff = self._normalize_date_str(self._permission_cutoff_date)
+        if requested_date and permission_cutoff and permission_cutoff < requested_date:
+            used_date = permission_cutoff
+            fallback_used = True
+            fallback_from = requested_date
 
         try:
-            raw = self._fetch_raw_industry(jq_code, requested_date)
+            raw = self._fetch_raw_industry(jq_code, used_date)
         except Exception as e:
             err_text = str(e)
             fallback_date = self._extract_permission_end_date(err_text)
             if fallback_date and requested_date and fallback_date < requested_date:
+                self._permission_cutoff_date = fallback_date
                 try:
                     raw = self._fetch_raw_industry(jq_code, fallback_date)
                     used_date = fallback_date
                     fallback_used = True
                     fallback_from = requested_date
+                    print(f"[jqdata] permission cutoff cached for this run: requested={requested_date} cutoff={fallback_date}")
                 except Exception as e2:
                     print(f"[jqdata] get_industry failed: {stock_code} date={requested_date} fallback_date={fallback_date} err={e2}")
                     self._cache[cache_key] = dict(base)

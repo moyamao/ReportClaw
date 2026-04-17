@@ -81,6 +81,8 @@ DEFAULT_KEYWORDS = {
 DEFAULT_CAGR_RULE: Dict[str, Any] = {
     "enabled": True,
     "phrase": "复合增长率",
+    "phrase_aliases": [],
+    "phrase_patterns": [],
     # mode:
     #   - "linear": score = floor(pct * k)
     #   - "thresholds": use thresholds list (see comment below)
@@ -96,6 +98,8 @@ DEFAULT_CAGR_RULE: Dict[str, Any] = {
     # If the extracted sentence contains any of these words, this CAGR hit becomes neutral (0 points).
     # The hit must still be written to DB, so downstream analysis can observe industry/company trends.
     "neutralize_if_contains": [],
+    # If phrase is "同比增长" and context contains any of these markers, force positive scoring.
+    "company_markers": ["公司", "本公司", "本集团", "集团公司", "母公司"],
     # If the extracted sentence contains any of these words, this CAGR hit becomes a discounted negative hit.
     # Example: original +8 -> -4 when ratio=0.5.
     "negate_if_contains": ["成本", "费用"],
@@ -595,6 +599,28 @@ def _normalize_cagr_context_for_dedupe(s: str) -> str:
     return s
 
 
+def _is_company_yoy_positive_override(
+    phrase: str,
+    compact_ctx: str,
+    company_markers: List[str],
+) -> bool:
+    """Return True when a yoy-growth hit should force positive scoring.
+
+    Business rule:
+    - If the hit is a "同比增长" style rule
+    - and the matched context clearly refers to the company itself
+    then we ignore other negative/neutral keyword modifiers and keep the hit positive.
+    """
+    if not phrase or not compact_ctx:
+        return False
+
+    phrase_s = str(phrase or "")
+    if ("同比增长" not in phrase_s) and ("同期增长" not in phrase_s) and ("同比增幅" not in phrase_s):
+        return False
+
+    return any(mark in compact_ctx for mark in company_markers)
+
+
 def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
     """Extra scoring rule for CAGR mentions.
 
@@ -632,6 +658,30 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
             continue
 
         phrase = str(r.get("phrase") or DEFAULT_CAGR_RULE.get("phrase") or "复合增长率")
+        phrase_aliases = r.get("phrase_aliases", DEFAULT_CAGR_RULE.get("phrase_aliases", []))
+        if not isinstance(phrase_aliases, list):
+            phrase_aliases = DEFAULT_CAGR_RULE.get("phrase_aliases", [])
+        phrase_aliases = [str(x).strip() for x in phrase_aliases if str(x).strip()]
+        phrase_patterns = r.get("phrase_patterns", DEFAULT_CAGR_RULE.get("phrase_patterns", []))
+        if not isinstance(phrase_patterns, list):
+            phrase_patterns = DEFAULT_CAGR_RULE.get("phrase_patterns", [])
+        phrase_patterns = [str(x).strip() for x in phrase_patterns if str(x).strip()]
+
+        phrase_matchers: List[Tuple[str, re.Pattern[str]]] = []
+        seen_matchers: set[str] = set()
+        for item in [phrase, *phrase_aliases]:
+            if item and item not in seen_matchers:
+                phrase_matchers.append((item, re.compile(re.escape(item))))
+                seen_matchers.add(item)
+        for pat in phrase_patterns:
+            key = f"re:{pat}"
+            if key in seen_matchers:
+                continue
+            try:
+                phrase_matchers.append((key, re.compile(pat)))
+                seen_matchers.add(key)
+            except re.error as e:
+                print(f"[score] invalid phrase_patterns regex skipped: {pat} err={e}")
         mode = str(r.get("mode") or "linear").lower()
         window_chars = int(r.get("window_chars") or 220)
         stop_chars = str(r.get("stop_chars") or "。！？!?；;")
@@ -663,6 +713,11 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
             neutralize_if_contains = []
         neutralize_if_contains = [str(x) for x in neutralize_if_contains if str(x).strip()]
 
+        company_markers = r.get("company_markers", DEFAULT_CAGR_RULE.get("company_markers", []))
+        if not isinstance(company_markers, list):
+            company_markers = DEFAULT_CAGR_RULE.get("company_markers", [])
+        company_markers = [str(x) for x in company_markers if str(x).strip()]
+
         negate_if_contains = r.get("negate_if_contains", ["成本", "费用"])
         if not isinstance(negate_if_contains, list):
             negate_if_contains = ["成本", "费用"]
@@ -693,164 +748,179 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
         thr_list.sort(key=lambda x: x[0])
 
         agg: Dict[str, Hit] = {}
-        for m in re.finditer(re.escape(phrase), text):
-            start = m.end()
-            tail = text[start : start + window_chars]
-            stop_m = stop_re.search(tail)
-            if stop_m:
-                tail = tail[: stop_m.start()]
+        for matcher_label, matcher_re in phrase_matchers:
+            for m in matcher_re.finditer(text):
+                active_phrase = m.group(0) if matcher_label.startswith("re:") else matcher_label
+                start = m.end()
+                tail = text[start : start + window_chars]
+                stop_m = stop_re.search(tail)
+                if stop_m:
+                    tail = tail[: stop_m.start()]
 
-            pm = pct_re.search(tail)
-            if not pm:
-                continue
-
-            try:
-                val = float(pm.group(1))
-            except Exception:
-                continue
-
-            pts = 0
-            label = ""
-
-            if mode == "thresholds":
-                best_sc = 0
-                best_ge: Optional[float] = None
-                for ge, sc in thr_list:
-                    if val >= ge:
-                        best_sc = sc
-                        best_ge = ge
-                if best_ge is None or best_sc <= 0:
+                pm = pct_re.search(tail)
+                if not pm:
                     continue
-                ge_txt = str(int(best_ge)) if float(best_ge).is_integer() else str(best_ge)
-                pts = best_sc
-                base_pts = pts
-                label = f">={ge_txt}%"
-            else:
-                # linear
-                if val < min_pct:
+
+                try:
+                    val = float(pm.group(1))
+                except Exception:
                     continue
-                pts = int(val * k)
-                if pts <= 0:
-                    continue
-                if pts > cap:
-                    pts = cap
-                base_pts = pts
-                label = f"={val:g}%"
+
+                pts = 0
+                label = ""
+
+                if mode == "thresholds":
+                    best_sc = 0
+                    best_ge: Optional[float] = None
+                    for ge, sc in thr_list:
+                        if val >= ge:
+                            best_sc = sc
+                            best_ge = ge
+                    if best_ge is None or best_sc <= 0:
+                        continue
+                    ge_txt = str(int(best_ge)) if float(best_ge).is_integer() else str(best_ge)
+                    pts = best_sc
+                    base_pts = pts
+                    label = f">={ge_txt}%"
+                else:
+                    # linear
+                    if val < min_pct:
+                        continue
+                    pts = int(val * k)
+                    if pts <= 0:
+                        continue
+                    if pts > cap:
+                        pts = cap
+                    base_pts = pts
+                    label = f"={val:g}%"
 
             # Context: prefer the clause containing the *percentage* (more specific than phrase).
             # For CAGR-like growth descriptions, the useful content is usually within one clause bounded by
             # 。 / ； / table markers like "□适用" and "不适用".
-            abs_pct_idx = m.end() + pm.start()
-            ctx = _extract_sentence_around(
-                text,
-                abs_pct_idx,
-                "。；;",
-                max_len=800,
-                boundary_chars_override=clause_boundaries,
-            )
-            if ctx:
+                abs_pct_idx = m.end() + pm.start()
+                ctx = _extract_sentence_around(
+                    text,
+                    abs_pct_idx,
+                    "。；;",
+                    max_len=800,
+                    boundary_chars_override=clause_boundaries,
+                )
+                if ctx:
                 # Trim common annual-report table markers so scoring context does not spill across
                 # lines like: "□适用 □不适用" or checked-box variants.
-                checkbox_prefixes = ["□", "☑", "☒", "■", "√", "✔"]
+                    checkbox_prefixes = ["□", "☑", "☒", "■", "√", "✔"]
 
                 # Left side: if the extracted text still contains a tail marker like "□不适用",
                 # keep content after the last such marker.
-                left_markers = [f"{p}不适用" for p in checkbox_prefixes] + ["不适用"]
-                best_left_end = -1
-                for mk in left_markers:
-                    pos = ctx.rfind(mk)
-                    if pos >= 0:
-                        end_pos = pos + len(mk)
-                        if end_pos > best_left_end:
-                            best_left_end = end_pos
-                if best_left_end >= 0:
-                    ctx = ctx[best_left_end:].strip()
+                    left_markers = [f"{p}不适用" for p in checkbox_prefixes] + ["不适用"]
+                    best_left_end = -1
+                    for mk in left_markers:
+                        pos = ctx.rfind(mk)
+                        if pos >= 0:
+                            end_pos = pos + len(mk)
+                            if end_pos > best_left_end:
+                                best_left_end = end_pos
+                    if best_left_end >= 0:
+                        ctx = ctx[best_left_end:].strip()
 
                 # Right side: stop before the next table marker, preferring explicit checkbox variants.
-                right_markers = (
-                    [f"{p}适用" for p in checkbox_prefixes]
-                    + [f"{p}不适用" for p in checkbox_prefixes]
-                    + ["适用", "不适用"]
-                )
-                cut_pos = -1
-                for mk in right_markers:
-                    pos = ctx.find(mk)
-                    if pos >= 0 and (cut_pos < 0 or pos < cut_pos):
-                        cut_pos = pos
-                if cut_pos >= 0:
-                    ctx = ctx[:cut_pos].strip()
+                    right_markers = (
+                        [f"{p}适用" for p in checkbox_prefixes]
+                        + [f"{p}不适用" for p in checkbox_prefixes]
+                        + ["适用", "不适用"]
+                    )
+                    cut_pos = -1
+                    for mk in right_markers:
+                        pos = ctx.find(mk)
+                        if pos >= 0 and (cut_pos < 0 or pos < cut_pos):
+                            cut_pos = pos
+                    if cut_pos >= 0:
+                        ctx = ctx[:cut_pos].strip()
 
-            # Be conservative when falling back to a short fixed window.
-            # Many normal annual-report narrative paragraphs contain several numbers/percentages,
-            # but they are still readable prose and should keep the full clause.
-            if _looks_table_noise(ctx) and len(ctx or "") > 600:
-                ctx = _extract_window_around(text, abs_pct_idx, window=260)
+                # Be conservative when falling back to a short fixed window.
+                # Many normal annual-report narrative paragraphs contain several numbers/percentages,
+                # but they are still readable prose and should keep the full clause.
+                if _looks_table_noise(ctx) and len(ctx or "") > 600:
+                    ctx = _extract_window_around(text, abs_pct_idx, window=260)
 
             # Apply context-based adjustments in this order.
             # All CAGR hits are preserved for DB analysis; only the score changes.
+            # 0) 公司本体同比增长优先 -> 强制保留正分，忽略其他关键词影响
             # 1) neutralize  -> 0分
             # 2) negate      -> 折扣负分（默认 0.5）
             # 3) full negate -> 全额负分
-            pol = "pos"
-            compact_ctx = re.sub(r"\s+", "", ctx or "")
+                pol = "pos"
+                compact_ctx = re.sub(r"\s+", "", ctx or "")
 
-            if compact_ctx and neutralize_if_contains:
-                for bad in neutralize_if_contains:
-                    if bad and bad in compact_ctx:
-                        pts = 0
-                        pol = "pos"
-                        break
-
-            if pts != 0 and compact_ctx and negate_if_contains:
-                for bad in negate_if_contains:
-                    if bad and bad in compact_ctx:
-                        pts = -max(1, int(abs(pts) * negate_penalty_ratio))
-                        pol = "neg"
-                        break
-
-            if pts != 0 and compact_ctx and full_negate_if_contains:
-                for bad in full_negate_if_contains:
-                    if bad and bad in compact_ctx:
-                        pts = -abs(int(base_pts))
-                        pol = "neg"
-                        break
-
-            kw_label = f"{phrase}{label}"
-            if pts == 0:
-                kw_label = f"{kw_label}[neutral]"
-            elif pts < 0 and abs(int(pts)) < abs(int(base_pts)):
-                kw_label = f"{kw_label}[negated]"
-            elif pts < 0 and abs(int(pts)) >= abs(int(base_pts)):
-                kw_label = f"{kw_label}[full_negated]"
-            norm_ctx = _normalize_cagr_context_for_dedupe(ctx)
-            dedupe_key = (kw_label, norm_ctx)
-            if dedupe_key in seen_exact:
-                continue
-            seen_exact.add(dedupe_key)
-            total += pts
-            if kw_label in agg:
-                agg_hit = agg[kw_label]
-                agg_hit.count += 1
-                # For repeated CAGR labels, keep the strongest absolute weight and prefer negative polarity when present.
-                if abs(int(pts)) > abs(int(agg_hit.weight)):
-                    agg_hit.weight = pts
-                if pol == "neg":
-                    agg_hit.polarity = "neg"
-                # Do NOT concatenate multiple contexts for CAGR hits; it quickly becomes unreadable
-                # (and often duplicates the same long sentence).
-                if not (agg_hit.context_sentence or agg_hit.context):
-                    if ctx:
-                        agg_hit.context = ctx
-                        agg_hit.context_sentence = ctx
-            else:
-                agg[kw_label] = Hit(
-                    keyword=kw_label,
-                    weight=pts,
-                    count=1,
-                    polarity=pol,
-                    context=ctx or None,
-                    context_sentence=ctx or None,
+                company_yoy_override = _is_company_yoy_positive_override(
+                    active_phrase,
+                    compact_ctx,
+                    company_markers,
                 )
+
+                if company_yoy_override:
+                    pts = abs(int(base_pts))
+                    pol = "pos"
+                else:
+                    if compact_ctx and neutralize_if_contains:
+                        for bad in neutralize_if_contains:
+                            if bad and bad in compact_ctx:
+                                pts = 0
+                                pol = "pos"
+                                break
+
+                    if pts != 0 and compact_ctx and negate_if_contains:
+                        for bad in negate_if_contains:
+                            if bad and bad in compact_ctx:
+                                pts = -max(1, int(abs(pts) * negate_penalty_ratio))
+                                pol = "neg"
+                                break
+
+                    if pts != 0 and compact_ctx and full_negate_if_contains:
+                        for bad in full_negate_if_contains:
+                            if bad and bad in compact_ctx:
+                                pts = -abs(int(base_pts))
+                                pol = "neg"
+                                break
+
+                kw_label = f"{active_phrase}{label}"
+                if pts == 0:
+                    kw_label = f"{kw_label}[neutral]"
+                elif pts < 0 and abs(int(pts)) < abs(int(base_pts)):
+                    kw_label = f"{kw_label}[negated]"
+                elif pts < 0 and abs(int(pts)) >= abs(int(base_pts)):
+                    kw_label = f"{kw_label}[full_negated]"
+                elif company_yoy_override:
+                    kw_label = f"{kw_label}[company_override]"
+                norm_ctx = _normalize_cagr_context_for_dedupe(ctx)
+                dedupe_key = (kw_label, norm_ctx)
+                if dedupe_key in seen_exact:
+                    continue
+                seen_exact.add(dedupe_key)
+                total += pts
+                if kw_label in agg:
+                    agg_hit = agg[kw_label]
+                    agg_hit.count += 1
+                    # For repeated CAGR labels, keep the strongest absolute weight and prefer negative polarity when present.
+                    if abs(int(pts)) > abs(int(agg_hit.weight)):
+                        agg_hit.weight = pts
+                    if pol == "neg":
+                        agg_hit.polarity = "neg"
+                    # Do NOT concatenate multiple contexts for CAGR hits; it quickly becomes unreadable
+                    # (and often duplicates the same long sentence).
+                    if not (agg_hit.context_sentence or agg_hit.context):
+                        if ctx:
+                            agg_hit.context = ctx
+                            agg_hit.context_sentence = ctx
+                else:
+                    agg[kw_label] = Hit(
+                        keyword=kw_label,
+                        weight=pts,
+                        count=1,
+                        polarity=pol,
+                        context=ctx or None,
+                        context_sentence=ctx or None,
+                    )
         hits.extend(agg.values())
 
     return total, hits

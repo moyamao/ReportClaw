@@ -1,6 +1,6 @@
 {
   "positive": {
-    "0到1": 30
+    "0到1": 20
   },
   "negative": {
     "过剩": -10,
@@ -11,11 +11,22 @@
       "_comment": "同比增长规则：所有命中都落库。公司本体经营增长优先加分；宏观/行业/第三方统计句子记 neutral；费用成本类按负向处理。",
       "enabled": true,
       "phrase": "同比增长",
+      "phrase_patterns": [
+        "(?:较|比)?(?:上年|去年)?同期增长",
+        "同比增幅"
+      ],
       "mode": "linear",
       "k": 0.1,
       "cap": 12,
       "min_pct": 20,
       "window_chars": 120,
+      "company_markers": [
+        "公司",
+        "本公司",
+        "本集团",
+        "集团公司",
+        "母公司"
+      ],
 
       "neutralize_if_contains": [
           "数据显示",

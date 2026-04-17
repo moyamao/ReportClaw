@@ -1,26 +1,14 @@
-# Core crawler / parser
+# Main pipeline only: main.py + report_scoring.py + daily_report.py + sheet_sync.py
 requests==2.32.5
 mysql-connector-python==9.6.0
 pdfminer.six==20251230
 pdfplumber==0.11.9
-
-# Optional industry enrichment used by main.py
 jqdatasdk==1.9.8
-
-# Scoring / report generation
 PyMySQL==1.1.2
 reportlab==4.4.10
 pillow==12.1.1
-
-# Google Sheets sync
 google-api-python-client==2.190.0
 google-auth==2.48.0
 google-auth-httplib2==0.3.0
 httplib2==0.31.2
 PySocks==1.7.1
-
-# Auxiliary scripts
-akshare==1.18.30
-pandas==3.0.1
-lxml==6.0.2
-pypdf==6.9.2

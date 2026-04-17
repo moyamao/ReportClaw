@@ -50,6 +50,25 @@ WHERE stock_code='000975' AND report_year=2025;
 清库重新来
 DELETE FROM annual_report_mda;
 DELETE FROM annual_reports;
+
+文件结构速览
+- 参数/路径：parse_args / 路径常量
+- 状态与运行配置：reportclaw.state / reportclaw.runtime_config
+- 外部服务适配：JoinQuantIndustryClient
+- 数据库访问：MySQLClient
+- PDF 解析核心：AnnualReportParser
+- 编排入口：main()
+
+推荐拆分方向
+- cli.py：命令行参数、路径常量、运行模式选择
+- state.py：增量状态读写
+- industry.py：聚宽行业适配
+- repository.py：MySQL 读写
+- parser.py：AnnualReportParser 及其文本规则
+- pipeline.py：候选公告收集、下载、并行解析、落库编排
+
+当前 main.py 更像“单文件应用”，这一版先通过文档和分段注释把模块边界标清，
+方便后续按职责拆文件，而不是在拆分时同时改业务逻辑。
 """
 import argparse
 import os
@@ -70,6 +89,29 @@ from typing import Any
 
 from pathlib import Path
 import signal
+from reportclaw.chairman_letter import extract_chairman_letter as extract_chairman_letter_impl
+from reportclaw.chairman_letter import normalize_for_letter as normalize_for_letter_impl
+from reportclaw.mda_support import (
+    build_fallback_mda as build_fallback_mda_impl,
+    extract_alt_sections as extract_alt_sections_impl,
+    extract_between_markers as extract_between_markers_impl,
+    truncate_text as truncate_text_impl,
+)
+from reportclaw.parse_pipeline import build_parse_jobs, run_parse_jobs
+from reportclaw.parser_sections import (
+    extract_section as extract_section_impl,
+    extract_section_by_keywords as extract_section_by_keywords_impl,
+    extract_section_by_ordinal as extract_section_by_ordinal_impl,
+    next_ordinal_candidates as next_ordinal_candidates_impl,
+    slice_to_next_bracket_heading as slice_to_next_bracket_heading_impl,
+    slice_to_next_heading_with_title_keywords as slice_to_next_heading_with_title_keywords_impl,
+    slice_to_next_major_heading as slice_to_next_major_heading_impl,
+    slice_to_next_ordinal as slice_to_next_ordinal_impl,
+)
+from reportclaw.pipeline import fetch_candidate_announcements, dedupe_candidates, download_missing_pdfs
+from reportclaw.repository import MySQLClient
+from reportclaw.runtime_config import load_main_runtime_config
+from reportclaw.state import load_last_crawl_ts, save_last_crawl_ts
 try:
     from jqdatasdk import auth as jq_auth, get_industry as jq_get_industry
     JQDATA_AVAILABLE = True
@@ -125,25 +167,6 @@ def parse_args():
     return p.parse_args()
 
 
-def _normalize_stock_code(stock_code: str | None) -> str | None:
-    if stock_code is None:
-        return None
-    s = str(stock_code).strip()
-    if not s:
-        return None
-    digits = re.sub(r"\D+", "", s)
-    if not digits:
-        return None
-    return digits.zfill(6)
-
-
-def _guess_cninfo_exchange(stock_code: str) -> tuple[str, str]:
-    code = str(stock_code).strip()
-    if code.startswith(("600", "601", "603", "605", "688", "689", "900")):
-        return "sse", "sh"
-    return "szse", "sz"
-
-
 def _score_reports_by_ids(report_ids: list[int]) -> None:
     ids = []
     seen = set()
@@ -180,48 +203,6 @@ def _score_reports_by_ids(report_ids: list[int]) -> None:
 # ===============================
 
 LAST_CRAWL_STATE_FILE = STATE_DIR / "last_sent.json"
-
-# ===============================
-# 性能优化：并行下载/并行解析（写库仍在主线程串行）
-# ===============================
-
-def _download_pdf_task(args: tuple[dict, str, requests.Session, tuple[int, int], int]) -> tuple[bool, str]:
-    """Download a PDF if missing.
-
-    Returns: (ok, message)
-    """
-    ann, file_path, session, get_timeout, max_retry = args
-    if os.path.exists(file_path):
-        return True, "exists"
-
-    try:
-        adj_url = ann.get("adjunctUrl")
-        if not adj_url:
-            return False, "no adjunctUrl"
-        pdf_url = "http://static.cninfo.com.cn/" + adj_url
-
-        pdf_resp = None
-        for attempt in range(1, max_retry + 1):
-            try:
-                pdf_resp = session.get(pdf_url, timeout=get_timeout)
-                pdf_resp.raise_for_status()
-                break
-            except Exception as e:
-                if attempt == max_retry:
-                    pdf_resp = None
-                    return False, f"download failed: {e}"
-                time.sleep(0.8 * attempt)
-
-        if pdf_resp is None:
-            return False, "download failed"
-
-        with open(file_path, "wb") as f:
-            f.write(pdf_resp.content)
-
-        return True, "downloaded"
-    except Exception as e:
-        return False, f"download exception: {e}"
-
 
 def _parse_pdf_task(args: tuple[str, int | None, str | None, int | None]) -> dict[str, Any]:
     """Parse one PDF in a worker process.
@@ -294,62 +275,35 @@ def _parse_pdf_task(args: tuple[str, int | None, str | None, int | None]) -> dic
         }
 
 
-def load_last_crawl_ts(path: Path) -> datetime | None:
-    """Load last crawl end time from shared json state file.
-
-    Shared schema (one file):
-      - last_sent_iso: used by daily_report
-      - last_crawl_end_iso: used by main crawler
-
-    Backward compatible:
-      - legacy key: last_end_iso
-    """
-    try:
-        if not path.exists():
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        if not isinstance(obj, dict):
-            return None
-
-        s = obj.get("last_crawl_end_iso") or obj.get("last_end_iso")
-        if not s:
-            return None
-
-        if isinstance(s, (int, float)):
-            return datetime.fromtimestamp(float(s))
-
-        s = str(s).strip()
-        if len(s) == 10:
-            return datetime.strptime(s, "%Y-%m-%d")
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def save_last_crawl_ts(path: Path, dt: datetime) -> None:
-    """Persist last crawl end time into shared json state file (do not overwrite other keys)."""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        obj = {}
-        if path.exists():
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    old = json.load(f)
-                if isinstance(old, dict):
-                    obj.update(old)
-            except Exception:
-                obj = {}
-
-        obj["last_crawl_end_iso"] = dt.isoformat(timespec="seconds")
-
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+def _build_worker_fallback_result(c: dict[str, Any], e: Exception) -> dict[str, Any]:
+    """Build a placeholder parse result when a worker crashes before returning a normal payload."""
+    parser_local = AnnualReportParser()
+    fb = parser_local.build_fallback_mda(
+        c["file_path"],
+        reason=f"exception:{type(e).__name__}",
+        page_count=int(c.get("page_count") or 0),
+    )
+    return {
+        "ok": False,
+        "mda": fb,
+        "reason": f"exception:{type(e).__name__}",
+        "page_count": c.get("page_count"),
+    }
 
 
 class JoinQuantIndustryClient:
+    """
+    行业信息补充适配层。
+
+    职责很单一：
+    - 读取 jqdata 配置并完成认证
+    - 以 (stock_code, date) 为键查询申万行业
+    - 做最小缓存和权限失败降级
+
+    后续拆分建议：
+    - 可整体迁到 `industry.py`
+    - 对外只保留 `get_sw_industry()` 一个主接口
+    """
     def __init__(self):
         cfg = configparser.ConfigParser()
         cfg.read(CONF_DIR / "config.ini", encoding="utf-8")
@@ -357,6 +311,7 @@ class JoinQuantIndustryClient:
         self.enabled = False
         self._cache = {}
         self._logged_disabled_reason = False
+        self._permission_cutoff_date = None
 
         if not JQDATA_AVAILABLE:
             self._log_disabled_once("[jqdata] jqdatasdk 未安装，跳过聚宽行业同步")
@@ -455,18 +410,25 @@ class JoinQuantIndustryClient:
         used_date = requested_date
         fallback_used = False
         fallback_from = None
+        permission_cutoff = self._normalize_date_str(self._permission_cutoff_date)
+        if requested_date and permission_cutoff and permission_cutoff < requested_date:
+            used_date = permission_cutoff
+            fallback_used = True
+            fallback_from = requested_date
 
         try:
-            raw = self._fetch_raw_industry(jq_code, requested_date)
+            raw = self._fetch_raw_industry(jq_code, used_date)
         except Exception as e:
             err_text = str(e)
             fallback_date = self._extract_permission_end_date(err_text)
             if fallback_date and requested_date and fallback_date < requested_date:
+                self._permission_cutoff_date = fallback_date
                 try:
                     raw = self._fetch_raw_industry(jq_code, fallback_date)
                     used_date = fallback_date
                     fallback_used = True
                     fallback_from = requested_date
+                    print(f"[jqdata] permission cutoff cached for this run: requested={requested_date} cutoff={fallback_date}")
                 except Exception as e2:
                     print(f"[jqdata] get_industry failed: {stock_code} date={requested_date} fallback_date={fallback_date} err={e2}")
                     self._cache[cache_key] = dict(base)
@@ -498,183 +460,21 @@ class JoinQuantIndustryClient:
         return dict(result)
 
 # ===============================
-# 数据库客户端
-# ===============================
-
-class MySQLClient:
-    """
-    MySQL 访问封装（最小职责）
-    - 读取 conf/config.ini 的 [mysql] 段建立连接
-    - 提供年报入库所需的基础操作：
-        * exists(stock_code, year): 判断同公司同年份是否已入库
-        * insert_report(...): 写 annual_reports，返回 report_id
-        * insert_mda(report_id, mda): 写 annual_report_mda
-
-    约定
-    - annual_reports 以 (stock_code, report_year) 作为逻辑唯一键（代码层面去重）。
-      如需更强一致性，建议在 DB 上加唯一索引 uq_stock_year(stock_code, report_year)。
-    """
-
-    def __init__(self):
-        config = configparser.ConfigParser()
-        config.read(CONF_DIR / "config.ini", encoding="utf-8")
-        if not config.has_section("mysql"):
-            raise RuntimeError(
-                f"config.ini 未读取到 [mysql] 段。请检查路径是否存在：{CONF_DIR / 'config.ini'}"
-            )
-
-        self.conn = mysql.connector.connect(
-            host=config["mysql"]["host"],
-            port=config.getint("mysql", "port"),
-            user=config["mysql"]["user"],
-            password=config["mysql"]["pass"],
-            database=config["mysql"]["db"]
-        )
-        self.annual_reports_columns = self._load_table_columns("annual_reports")
-
-    def get_report_id(self, stock_code, year):
-        """Return existing annual_reports.id if present, else None."""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT id FROM annual_reports WHERE stock_code=%s AND report_year=%s",
-            (stock_code, year)
-        )
-        row = cursor.fetchone()
-        return row[0] if row else None
-
-    def is_mda_complete(self, report_id: int) -> bool:
-        """Treat placeholder/failed parses as NOT complete so the pipeline can retry on later runs."""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT industry_section, main_business_section, future_section, chairman_letter, full_mda
-            FROM annual_report_mda
-            WHERE report_id=%s
-            LIMIT 1
-            """,
-            (report_id,)
-        )
-        row = cursor.fetchone()
-        if not row:
-            return False
-
-        ind, biz, fut, chairman, full = row
-
-        # If we stored a failure sentinel, allow retry.
-        if isinstance(full, str) and full.startswith("[PARSE_FAILED]"):
-            return False
-
-        # Otherwise: consider complete if we have any meaningful extracted section.
-        if (biz and len(biz) >= 500) or (fut and len(fut) >= 200) or (ind and len(ind) >= 200) or (
-                chairman and len(chairman) >= 200):
-            return True
-
-        # If only full_mda exists but is tiny, treat as incomplete.
-        if full and isinstance(full, str) and len(full) >= 5000:
-            return True
-
-        return False
-
-    def upsert_report(self, stock_code, stock_name, year, publish_date, file_path, industry_info=None):
-        base_data = {
-            "stock_code": stock_code,
-            "stock_name": stock_name,
-            "report_year": year,
-            "publish_date": publish_date,
-            "file_path": file_path,
-        }
-        if industry_info:
-            base_data.update(industry_info)
-
-        write_data = self._filter_existing_columns(base_data, "annual_reports")
-
-        existing_id = self.get_report_id(stock_code, year)
-        cursor = self.conn.cursor()
-
-        if existing_id is None:
-            cols = list(write_data.keys())
-            placeholders = ", ".join(["%s"] * len(cols))
-            sql = f"INSERT INTO annual_reports ({', '.join(cols)}) VALUES ({placeholders})"
-            cursor.execute(sql, tuple(write_data[c] for c in cols))
-            self.conn.commit()
-            return cursor.lastrowid
-
-        update_data = {k: v for k, v in write_data.items() if k not in {"stock_code", "report_year"}}
-        if update_data:
-            set_sql = ", ".join([f"{k}=%s" for k in update_data.keys()])
-            sql = f"UPDATE annual_reports SET {set_sql} WHERE id=%s"
-            cursor.execute(sql, tuple(update_data[k] for k in update_data.keys()) + (existing_id,))
-            self.conn.commit()
-
-        return existing_id
-
-    def insert_report(self, stock_code, stock_name, year, publish_date, file_path):
-        cursor = self.conn.cursor()
-        sql = """
-        INSERT INTO annual_reports
-        (stock_code, stock_name, report_year, publish_date, file_path)
-        VALUES (%s, %s, %s, %s, %s)
-        """
-        cursor.execute(sql, (stock_code, stock_name, year, publish_date, file_path))
-        self.conn.commit()
-        return cursor.lastrowid
-
-    def insert_mda(self, report_id, mda):
-        cursor = self.conn.cursor()
-        # If row exists, update; else insert.
-        cursor.execute("SELECT id FROM annual_report_mda WHERE report_id=%s LIMIT 1", (report_id,))
-        row = cursor.fetchone()
-        if row:
-            sql = """
-            UPDATE annual_report_mda
-            SET industry_section=%s,
-                main_business_section=%s,
-                future_section=%s,
-                chairman_letter=%s,
-                full_mda=%s
-            WHERE report_id=%s
-            """
-            cursor.execute(sql, (
-                mda.get("industry"),
-                mda.get("business"),
-                mda.get("future"),
-                mda.get("chairman_letter"),
-                mda.get("full_mda"),
-                report_id
-            ))
-        else:
-            sql = """
-            INSERT INTO annual_report_mda
-            (report_id, industry_section, main_business_section, future_section, chairman_letter, full_mda)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            cursor.execute(sql, (
-                report_id,
-                mda.get("industry"),
-                mda.get("business"),
-                mda.get("future"),
-                mda.get("chairman_letter"),
-                mda.get("full_mda"),
-            ))
-        self.conn.commit()
-
-    def _load_table_columns(self, table_name: str) -> set[str]:
-        cursor = self.conn.cursor()
-        cursor.execute(f"SHOW COLUMNS FROM {table_name}")
-        return {row[0] for row in cursor.fetchall()}
-
-    def _filter_existing_columns(self, data: dict, table_name: str) -> dict:
-        if table_name == "annual_reports":
-            allowed = self.annual_reports_columns
-        else:
-            allowed = self._load_table_columns(table_name)
-        return {k: v for k, v in data.items() if k in allowed}
-
-
-# ===============================
 # PDF解析器
 # ===============================
 class AnnualReportParser:
+    """
+    年报 PDF 文本解析器。
+
+    这是当前文件里最“值得单独拆包”的部分，内部其实已经包含几层不同职责：
+    - 文本预处理：normalize / _preprocess_text_for_extract / 表格压缩
+    - PDF 体检：_is_image_heavy_pdf
+    - 特定段落抽取：extract_chairman_letter / extract_alt_sections
+    - MDA 主流程：extract_mda
+    - 标题/序号切片工具：extract_section_by_keywords 等
+
+    后续如果拆文件，建议优先从这里开始，把“纯文本规则函数”和“PDF IO”分开。
+    """
 
     def _compress_tables_keep_head_tail(
         self,
@@ -775,57 +575,10 @@ class AnnualReportParser:
         t = self._compress_tables_keep_head_tail(t)
         return t
     def normalize_for_letter(self, text: str) -> str:
-        """A gentler normalizer for chairman letter extraction.
-
-        Goals:
-        - keep line breaks as much as possible (signature lines must not be merged)
-        - still remove obvious page headers/footers/page numbers
-        - do NOT remove all spaces
-        """
-        if not text:
-            return ""
-
-        text = self._preprocess_text_for_extract(text)
-
-        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x0c", "\n")
-        # keep at most 2 consecutive blank lines
-        text = re.sub(r"\n{3,}", "\n\n", text)
-
-        lines: list[str] = []
-        for raw in text.split("\n"):
-            # keep blank lines (for paragraph/signature separation)
-            if raw is None:
-                continue
-            s = raw.strip()
-            if s == "":
-                lines.append("")
-                continue
-
-            # Page numbers
-            if re.fullmatch(r"\d{1,4}", s):
-                continue
-            if re.fullmatch(r"\d{1,4}\s*/\s*\d{1,4}", s):
-                continue
-
-            # Common headers/footers
-            if ("年度报告" in s) and ("股份有限公司" in s or "有限公司" in s):
-                continue
-            if "年度报告全文" in s:
-                continue
-            if s.startswith("公司代码：") or s.startswith("公司简称：") or ("公司代码：" in s):
-                continue
-
-            # Very short company-only header lines
-            if (s.endswith("股份有限公司") or s.endswith("有限公司")) and len(s) <= 30:
-                continue
-
-            # Keep the line but normalize inner whitespace a bit (do not delete it)
-            lines.append(re.sub(r"\s+", " ", s))
-
-        # collapse excessive blank runs again
-        out = "\n".join(lines)
-        out = re.sub(r"\n{3,}", "\n\n", out)
-        return out.strip()
+        return normalize_for_letter_impl(
+            text,
+            preprocess_text=self._preprocess_text_for_extract,
+        )
     MAJOR_HEADING_KEYWORDS = [
         "核心竞争力", "核心竞争力分析",
         "主营业务分析", "主营业务",
@@ -925,766 +678,31 @@ class AnnualReportParser:
 
 
     def _extract_between_markers(self, text: str, start_pat: str, end_pats: list[str], *, flags=re.MULTILINE):
-        """Extract substring starting at start_pat until earliest match of any end_pats."""
-        m_start = re.search(start_pat, text, flags)
-        if not m_start:
-            return None
-        start = m_start.start()
-
-        end = None
-        tail = text[m_start.end():]
-        for ep in end_pats:
-            m_end = re.search(ep, tail, flags)
-            if m_end:
-                cand = m_start.end() + m_end.start()
-                end = cand if end is None else min(end, cand)
-
-        if end is None:
-            end = len(text)
-        return text[start:end].strip()
+        return extract_between_markers_impl(text, start_pat, end_pats, flags=flags)
 
 
     def _truncate(self, s: str | None, max_len: int) -> str | None:
-        if not s:
-            return s
-        if len(s) <= max_len:
-            return s
-        return s[:max_len].rstrip() + "\n\n[...TRUNCATED...]"
+        return truncate_text_impl(s, max_len)
 
 
     def extract_alt_sections(self, pdf_path: str, *, max_pages: int = 260) -> dict | None:
-        """Fallback extractor for non-standard annual reports without '第三节 管理层讨论与分析'.
-
-        Strategy:
-        - Drop boilerplates: 重要提示 / 目录 / 释义 / 词汇表
-        - Prefer extracting from: 董事长致辞 + 第二章 董事会报告
-        - Outlook: prefer numeric heading '2.3.1 2026年业务展望', otherwise keyword '2026年业务展望/业务展望'
-        """
-        try:
-            raw = self.extract_text(pdf_path, page_numbers=list(range(0, max_pages)))
-        except Exception:
-            raw = ""
-        if not raw:
-            return None
-
-        t = raw
-
-        # --- helper: drop common boilerplate blocks ---
-        def _drop_block(src: str, start_pat: str, end_pats: list[str]) -> str:
-            blk = self._extract_between_markers(src, start_pat, end_pats)
-            return src.replace(blk, "") if blk else src
-
-        # 目录/释义/词汇表 经常会非常长，优先剔除
-        t = _drop_block(t, r"(?:^|\n)目\s*录\b", [r"(?:^|\n)第一[章节]\b", r"(?:^|\n)第一节\b"])
-        t = _drop_block(t, r"(?:^|\n)释\s*义\b", [r"(?:^|\n)(?:词\s*汇\s*表|第一[章节]|第一节)\b"])
-        t = _drop_block(t, r"(?:^|\n)词\s*汇\s*表\b", [r"(?:^|\n)(?:第一[章节]|第一节)\b"])
-
-        # 对于某些模板：重要提示会出现在最前面，直接截到更有信息密度的起点
-        # 优先：管理层综述/董事长致辞/董事会报告
-        for anchor in [
-            r"(?:^|\n)董事长致辞\b",
-            r"(?:^|\n)管理层综述\b",
-            r"(?:^|\n)第二章\s*董事会报告\b",
-            r"(?:^|\n)(?:董事会报告|董事会工作报告|董事会报告书)\b",
-        ]:
-            m = re.search(anchor, t)
-            if m:
-                t = t[m.start():]
-                break
-
-        # --- 1) Summary / Overview: combine multiple useful sections ---
-        # A) 管理层综述（若存在，优先）
-        overview = self._extract_between_markers(
-            t,
-            r"(?:^|\n)管理层综述\b",
-            [
-                r"(?:^|\n)董事长致辞\b",
-                r"(?:^|\n)第二章\s*董事会报告\b",
-                r"(?:^|\n)董事会报告\b",
-                r"(?:^|\n)第三节\s*管理层讨论与分析\b",
-                r"(?:^|\n)公司治理\b",
-                r"(?:^|\n)重要事项\b",
-                r"(?:^|\n)(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]\s*报告期内核心竞争力分析\b",
-            ],
+        return extract_alt_sections_impl(
+            pdf_path,
+            max_pages=max_pages,
+            extract_text_fn=self.extract_text,
+            extract_between_markers_fn=self._extract_between_markers,
+            truncate_text_fn=self._truncate,
+            extract_chairman_letter_fn=self.extract_chairman_letter,
         )
-
-        # C) 董事会报告（不同模板写法差异大）
-        board = self._extract_between_markers(
-            t,
-            r"(?:^|\n)(?:第二章\s*)?(?:董事会报告|董事会工作报告|董事会报告书)\b",
-            [
-                r"(?:^|\n)第三章\b",
-                r"(?:^|\n)第三节\s*管理层讨论与分析\b",
-                r"(?:^|\n)公司治理\b",
-                r"(?:^|\n)重要事项\b",
-            ],
-        )
-
-        # Combine and de-duplicate (avoid repeating identical blocks)
-        summary_parts: list[str] = []
-        for part in [overview, board]:
-            if not part:
-                continue
-            p = part.strip()
-            if not p:
-                continue
-            # skip if largely contained in previous parts
-            if any((p in x) or (x in p) for x in summary_parts):
-                continue
-            summary_parts.append(p)
-
-        summary_text = "\n\n".join(summary_parts).strip() if summary_parts else None
-
-        # --- 2) Outlook: keyword-first fallback (do NOT rely on ordinal numbers) ---
-        # Some annual reports (e.g., ZTE) use a different structure and do not have the standard
-        # “十一、公司未来发展的展望”. In that case, we treat “业务展望/2026年业务展望/2026年业务发展展望”
-        # as the primary signal and slice until the next major heading.
-        outlook = None
-
-        # 2.1 Prefer the most explicit heading form first:
-        # e.g. "2.3 2026年业务展望和面对的经营风险" / "2．3 2026年业务展望…"
-        # NOTE: normalize() removed normal spaces, but may keep newlines; be tolerant.
-        m_head = re.search(
-            r"(?:^|\n)\s*2\s*[\.．]\s*3(?:\s*[\.．]\s*\d+)?\s*[^\n]{0,80}?(?:2026\s*年?)?\s*业务展望[^\n]{0,120}?(?:经营风险|风险)?\b",
-            t,
-        )
-
-        out_kw = None
-        out_idx = None
-        if m_head:
-            out_idx = m_head.start()
-            out_kw = "业务展望"
-        else:
-            # 2.2 Fallback: search by keyword only (works when numbering is missing)
-            for kw in ["2026年业务展望", "2026年业务发展展望", "业务展望"]:
-                idx = t.find(kw)
-                if idx != -1:
-                    out_kw = kw
-                    out_idx = idx
-                    break
-
-        if out_idx is not None:
-            # Start from the beginning of the line that contains the keyword.
-            line_start = t.rfind("\n", 0, out_idx)
-            start = 0 if line_start < 0 else (line_start + 1)
-
-            tail = t[out_idx:]
-
-            # End at the next major heading.
-            # Be tolerant: extracted text sometimes loses newlines around headings.
-            end_patterns = [
-                # Next sibling subsection (e.g. 2.3.2 / 2.3.3 ...) or next major section (2.4 / 3.)
-                r"(?:\n\s*|\s)2\s*[\.．]\s*3\s*[\.．]\s*[2-9]",
-                r"(?:\n\s*|\s)2\s*[\.．]\s*4\b",
-                r"(?:\n\s*|\s)3\s*[\.．]\s*\d",
-
-                # Also accept heading without explicit whitespace/newline before it (rare but happens)
-                r"2\s*[\.．]\s*4\b",
-                r"3\s*[\.．]\s*\d\b",
-
-                # Next Chinese/Arabic major ordinal like 十二、/12、
-                r"(?:\n)\s*(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]",
-
-                # Next chapter/section style
-                r"(?:\n)\s*第\s*[一二三四五六七八九十]{1,3}\s*[章节]",
-
-                # Strong stop words (chapters we never want inside outlook)
-                r"(?:\n)\s*(?:十\s*二|12)\s*[、\.．:：]?\s*报告期内接待调研",
-                r"(?:\n)\s*(?:十\s*三|13)\s*[、\.．:：]?\s*市值管理",
-                r"(?:\n)\s*(?:目\s*录|释\s*义|词\s*汇\s*表)",
-                r"(?:\n)\s*公司治理",
-                r"(?:\n)\s*重要事项",
-                r"(?:\n)\s*(?:可能面对的风险|风险因素|风险提示)",
-            ]
-
-            end = None
-            for ep in end_patterns:
-                m_end = re.search(ep, tail)
-                if not m_end:
-                    continue
-                cand = out_idx + m_end.start()
-                # Avoid cutting too early (must be meaningfully after the start)
-                if cand <= start + 50:
-                    continue
-                end = cand if end is None else min(end, cand)
-
-            if end is None:
-                end = len(t)
-
-            outlook = t[start:end].strip()
-
-        # As a hard safety: if outlook accidentally contains '报告期内接待调研/市值管理', cut it.
-        if outlook:
-            leak_pats = [
-                r"(?:\n)\s*(?:十\s*二|12)\s*[、\.．:：]?\s*报告期内接待调研",
-                r"(?:\n)\s*(?:十\s*三|13)\s*[、\.．:：]?\s*市值管理",
-            ]
-            cut_at = None
-            for pat in leak_pats:
-                m = re.search(pat, outlook)
-                if m:
-                    cut_at = m.start() if cut_at is None else min(cut_at, m.start())
-            if cut_at is not None:
-                outlook = outlook[:cut_at].strip()
-
-        # Final truncation bounds
-        if summary_text:
-            summary_text = self._truncate(summary_text, 70000)
-        if outlook:
-            outlook = self._truncate(outlook, 40000)
-
-        # If we still got nothing meaningful, give up.
-        if not summary_text and not outlook:
-            return None
-
-        full_parts = []
-        if summary_text:
-            full_parts.append(summary_text)
-        if outlook:
-            full_parts.append(outlook)
-        full = "\n\n".join(full_parts)
-        full = self._truncate(full, 140000)
-
-        chairman_letter = self.extract_chairman_letter(pdf_path, max_pages=25)
-        return {
-            "industry": None,
-            "chairman_letter": chairman_letter,
-            "business": summary_text,
-            "future": outlook,
-            "full_mda": full,
-        }
 
     def extract_chairman_letter(self, pdf_path: str, *, max_pages: int = 25) -> str | None:
-        """Extract chairman/board-chair letter from the front matter (first N pages).
-
-        - Only scan the first `max_pages` pages (default 25).
-        - Try to capture the full letter including signature lines.
-        - If not found, return None.
-
-        This is independent from MDA extraction to avoid breaking existing logic.
-        """
-        # Preflight: if front matter is image-heavy, skip quickly.
-        is_heavy, st = self._is_image_heavy_pdf(
+        return extract_chairman_letter_impl(
             pdf_path,
-            sample_pages=min(6, max_pages),
-            min_images=16,
-            max_total_text_chars=500,
-            min_avg_text_chars_per_page=80,
-            max_file_mb=30,
+            max_pages=max_pages,
+            normalize_for_letter_fn=self.normalize_for_letter,
+            is_image_heavy_pdf_fn=self._is_image_heavy_pdf,
+            log_fn=self._log,
         )
-        if is_heavy:
-            self._log(
-                f"[perf] image-heavy front matter, skip chairman letter. "
-                f"file_mb={st.get('file_mb')} images={st.get('images')} text_chars={st.get('text_chars')} avg_text_chars={st.get('avg_text_chars')}"
-            )
-            return "[CHAIRMAN_LETTER_HINT] 该PDF前部页面图片占比高，董事长致辞正文抽取失败概率大；建议打开原PDF查看。"
-
-        try:
-            raw_front = pdfminer_extract_text(pdf_path, page_numbers=list(range(0, max_pages))) or ""
-            front = self.normalize_for_letter(raw_front)
-        except Exception:
-            front = ""
-        if not front:
-            return None
-
-        t = front
-
-        def _refine_letter_tail(s: str) -> str:
-            if not s:
-                return s
-
-            def _split_inline_signature_line(ln: str) -> list[str]:
-                """Split a line like '赵顺强 董事长兼首席执行官 2026年3月24日' into separate lines.
-
-                Some PDFs lose line breaks and collapse the signature into one line; we recover it here.
-                """
-                if not ln:
-                    return [ln]
-
-                src = ln.strip()
-                if not src:
-                    return [""]
-
-                # Detect date substring
-                m_date = re.search(
-                    r"(?:\d{4}年\d{1,2}月(?:\d{1,2}日)?|[二〇○零一二三四五六七八九十]{2,4}年[一二三四五六七八九十]{1,3}月(?:[一二三四五六七八九十]{1,3}日)?)",
-                    src,
-                )
-                date_part = m_date.group(0) if m_date else None
-
-                # Detect role substring
-                m_role = re.search(r"(?:董事长|主席|董事会主席|董事会全体成员|董事会)[^\d]{0,20}", src)
-                role_part = None
-                if m_role:
-                    role_part = m_role.group(0).strip()
-
-                if not (date_part or role_part):
-                    return [ln]
-
-                # Split into: name-ish prefix, role-ish, date
-                parts: list[str] = []
-
-                working = src
-                if date_part and date_part in working:
-                    working = working.replace(date_part, "")
-
-                if role_part and role_part in working:
-                    before, _, after = working.partition(role_part)
-                    name_part = before.strip(" ：:，,;；")
-                    if name_part:
-                        parts.append(name_part)
-                    parts.append(role_part.strip(" ：:，,;；"))
-                    rest = after.strip(" ：:，,;；")
-                    if rest:
-                        parts.append(rest)
-                else:
-                    # No clear role, treat the remaining as name/loc
-                    rem = working.strip(" ：:，,;；")
-                    if rem:
-                        parts.append(rem)
-
-                if date_part:
-                    parts.append(date_part)
-
-                # keep only short parts; if something becomes long, fall back to the original line
-                if any(len(re.sub(r"\s+", "", p)) > 40 for p in parts):
-                    return [ln]
-
-                return parts
-
-            raw_lines: list[str] = []
-            for ln in s.split("\n"):
-                ln = (ln or "").replace("\r", "")
-                # preserve blanks
-                if ln.strip() == "":
-                    raw_lines.append("")
-                    continue
-                raw_lines.extend(_split_inline_signature_line(ln))
-
-            date_pat = re.compile(
-                r"(?:\d{4}年\d{1,2}月(?:\d{1,2}日)?|[二〇○零一二三四五六七八九十]{2,4}年[一二三四五六七八九十]{1,3}月(?:[一二三四五六七八九十]{1,3}日)?)"
-            )
-            company_pat = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]{2,60}(?:股份有限公司|有限公司|集团|公司)(?:董事会)?")
-            role_pat = re.compile(r"^(?:董事长|主席|董事会主席|董事会)(?:[：:]?\s*[\u4e00-\u9fffA-Za-z·•]{1,16})?$")
-            role_inline_pat = re.compile(r"(?:董事长|主席|董事会主席)[：:]?\s*[\u4e00-\u9fffA-Za-z·•]{1,16}")
-
-            def _is_section_heading_line(x: str) -> bool:
-                c = re.sub(r"\s+", "", x or "")
-                if not c:
-                    return False
-                if re.match(
-                    r"^(?:第[一二三四五六七八九十0-9]{1,3}(?:章|节|部分)|(?:第一|第二|第三|第四|第五|第六|第七|第八|第九|第十|第十一|第十二|第十三)(?:章|节|部分))",
-                    c,
-                ):
-                    return True
-                if re.match(r"^(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]", c):
-                    return True
-                # 典型下一章内容（很短时才认为是标题）
-                if any(k in c for k in ("重要提示", "目录", "释义", "名词解释", "公司概况", "公司简介", "董事会报告", "董事局报告", "管理层讨论与分析", "财务报告", "财务报表")):
-                    if len(c) <= 40:
-                        return True
-                return False
-
-            def _sig_types(ln: str) -> set[str]:
-                tags: set[str] = set()
-                t = (ln or "").strip()
-                if not t:
-                    return tags
-                compact = re.sub(r"\s+", "", t)
-
-                # date 必须是“单独一行”的日期，避免页眉/正文误触发
-                if len(compact) <= 20 and date_pat.fullmatch(compact):
-                    tags.add("date")
-
-                # company/board line：排除页眉页脚（年度报告/报告全文），限制长度避免误判正文
-                if ("年度报告" not in t) and ("报告全文" not in t) and (len(compact) <= 40):
-                    if company_pat.search(t) and any(
-                            k in t for k in ("董事会", "董事局", "董事会全体成员", "董事会主席", "董事长", "主席")):
-                        tags.add("company")
-
-                # role-only line
-                if role_pat.match(re.sub(r"\s+", "", t)):
-                    tags.add("role")
-
-                # role + name inline
-                if len(compact) <= 25 and role_inline_pat.search(t):
-                    tags.add("signer")
-
-                # standalone name (often appears as a single short line above role/date)
-                # keep it conservative to avoid matching normal body lines
-                if len(compact) <= 8 and re.fullmatch(r"[\u4e00-\u9fff·•]{2,8}", compact):
-                    tags.add("name")
-
-                return tags
-
-            n = len(raw_lines)
-            if n == 0:
-                return s
-
-            # Scan only near the end
-            scan_start = max(0, n - 40)
-
-            # Collect indices with any signature-like tags
-            sig_idxs: list[int] = []
-            for i in range(n - 1, scan_start - 1, -1):
-                if _sig_types(raw_lines[i]):
-                    sig_idxs.append(i)
-
-            cut_end_idx = None
-            if sig_idxs:
-                cluster_end = max(sig_idxs)
-                cluster_start = cluster_end
-
-                # expand upward to include adjacent signature lines / blanks (tight)
-                while cluster_start - 1 >= scan_start:
-                    prev = raw_lines[cluster_start - 1]
-                    if _sig_types(prev):
-                        cluster_start -= 1
-                        continue
-                    if (prev or "").strip() == "":
-                        cluster_start -= 1
-                        continue
-                    break
-
-                # collect types in cluster
-                cluster_types: set[str] = set()
-                for k in range(cluster_start, cluster_end + 1):
-                    cluster_types |= _sig_types(raw_lines[k])
-
-                # extend forward at most 2 lines, and never跨入下一章
-                extend_to = cluster_end
-                for k in range(cluster_end + 1, min(n, cluster_end + 3)):
-                    if _is_section_heading_line(raw_lines[k]):
-                        break
-                    # allow blank/date/company/role line only
-                    if _sig_types(raw_lines[k]) or (raw_lines[k] or "").strip() == "":
-                        extend_to = k
-                        cluster_types |= _sig_types(raw_lines[k])
-                        continue
-                    break
-
-                # New rule: if we see TWO consecutive short signature-like lines (name/role/signer/date/company)
-                # and the lines are visually "short" (<= 20 chars after whitespace), treat it as end-of-letter.
-                short_sig_run = 0
-                for k in range(cluster_start, extend_to + 1):
-                    if (raw_lines[k] or "").strip() == "":
-                        continue
-                    tags = _sig_types(raw_lines[k])
-                    if tags and len(re.sub(r"\s+", "", raw_lines[k])) <= 20:
-                        short_sig_run += 1
-                        if short_sig_run >= 2:
-                            # ensure we cut at this point (do not include any further content)
-                            extend_to = k
-                            break
-                    else:
-                        short_sig_run = 0
-
-                # accept when at least TWO of the signature facets appear
-                # (company/role/signer/date); company+signer or signer+date are common.
-                if len(cluster_types) >= 2:
-                    cut_end_idx = extend_to
-
-            if cut_end_idx is not None:
-                kept = raw_lines[: cut_end_idx + 1]
-
-                # If any clear report-body heading leaked into kept, trim it away.
-                for i in range(max(0, len(kept) - 30), len(kept)):
-                    if _is_section_heading_line(kept[i]) and i > 0:
-                        kept = kept[:i]
-                        break
-
-                # Normalize spacing: exactly ONE blank line between body and signature block.
-                sig_i = None
-                for i in range(max(0, len(kept) - 25), len(kept)):
-                    if _sig_types(kept[i]):
-                        sig_i = i
-                        break
-                if sig_i is not None and sig_i > 0:
-                    head = kept[:sig_i]
-                    tail = kept[sig_i:]
-                    while head and (head[-1] or "").strip() == "":
-                        head.pop()
-                    while tail and (tail[0] or "").strip() == "":
-                        tail.pop(0)
-                    return "\n".join(head) + "\n\n" + "\n".join(tail).rstrip()
-
-                return "\n".join(kept).rstrip()
-
-            # No signature block detected: guard against leaking next section
-            trimmed = "\n".join(raw_lines).rstrip()
-            guard_pats = [
-                r"(?:^|\n)\s*第\s*[一二三四五六七八九十0-9]{1,3}\s*节\s*重要提示",
-                r"(?:^|\n)\s*第一节\s*重要提示",
-                r"(?:^|\n)\s*重要提示(?:、|\s)",
-                r"(?:^|\n)\s*目\s*录\b",
-                r"(?:^|\n)\s*释\s*义\b",
-                r"(?:^|\n)\s*(?:公司概况|公司简介|公司基本情况|董事会报告|董事局报告|管理层讨论与分析)\b",
-            ]
-            cut_pos = None
-            for pat in guard_pats:
-                mm = re.search(pat, trimmed)
-                if mm and mm.start() > 200:
-                    cut_pos = mm.start() if cut_pos is None else min(cut_pos, mm.start())
-            if cut_pos is not None:
-                trimmed = trimmed[:cut_pos].rstrip()
-            return trimmed
-
-        # Remove front-matter blocks that often contain TOC lines like “董事长致辞……12”.
-        # IMPORTANT: do NOT delete from “目录” to end-of-text when the report does not have “第一章/第一节”.
-        # We therefore:
-        #  - try bounded block removal with richer end markers
-        #  - and additionally strip TOC-like lines (dot leaders / trailing small page numbers)
-        def _drop_block(src: str, start_pat: str, end_pats: list[str], *, max_chars: int = 18000) -> str:
-            blk = self._extract_between_markers(src, start_pat, end_pats)
-            if not blk:
-                return src
-            # Guard: if the extracted block is unreasonably large, it likely did not find a real end marker.
-            if len(blk) > max_chars:
-                return src
-            return src.replace(blk, "")
-
-        def _strip_toc_like_lines(src: str) -> str:
-            """Remove TOC entry lines but keep real body.
-
-            Patterns we remove (common):
-              - '董事长致辞 …… 7'
-              - '管理层讨论与分析.... 20'
-              - '第一章 XXX .... 5'
-              - short title lines ending with a small page number
-            """
-            out: list[str] = []
-            for ln in src.split("\n"):
-                s = (ln or "").strip()
-                if not s:
-                    out.append(ln)
-                    continue
-
-                # Strong TOC marker: dot leaders + trailing page number
-                if re.search(r"[\.·…]{4,}\s*\d{1,4}\s*$", s):
-                    continue
-
-                # Also treat short title + trailing page number as TOC entry.
-                # (Avoid dropping years like 2026; keep long sentences.)
-                if len(s) <= 30 and re.search(r"\s\d{1,4}\s*$", s) and not re.search(r"(?:19|20)\d{2}\s*$", s):
-                    continue
-
-                out.append(ln)
-            return "\n".join(out)
-
-        # 目录/释义/词汇表/重要提示 经常会包含“董事长致辞……页码”，先剔除再找正文。
-        # End markers are intentionally broad (important for CN/HK blue chips where TOC is followed by 重要提示/公司简介).
-        t = _drop_block(
-            t,
-            r"(?:^|\n)重\s*要\s*提\s*示\b",
-            [
-                r"(?:^|\n)目\s*录\b",
-                r"(?:^|\n)释\s*义\b",
-                r"(?:^|\n)词\s*汇\s*表\b",
-                r"(?:^|\n)公司简介\b",
-                r"(?:^|\n)公司概况\b",
-                r"(?:^|\n)主要财务数据\b",
-                r"(?:^|\n)董事长致辞\b",
-                r"(?:^|\n)第\s*[一二三四五六七八九十0-9]{1,3}\s*(?:章|节|部分|篇)\b",
-                r"(?:^|\n)第一[章节]\b",
-            ],
-        )
-        t = _drop_block(
-            t,
-            r"(?:^|\n)目\s*录\b",
-            [
-                r"(?:^|\n)重\s*要\s*提\s*示\b",
-                r"(?:^|\n)公司简介\b",
-                r"(?:^|\n)公司概况\b",
-                r"(?:^|\n)主要财务数据\b",
-                r"(?:^|\n)董事长致辞\b",
-                r"(?:^|\n)经营业绩回顾",
-                r"(?:^|\n)管理层讨论与分析\b",
-                r"(?:^|\n)第\s*[一二三四五六七八九十0-9]{1,3}\s*(?:章|节|部分|篇)\b",
-                r"(?:^|\n)第一[章节]\b",
-                r"(?:^|\n)第一节\b",
-            ],
-        )
-        t = _drop_block(
-            t,
-            r"(?:^|\n)释\s*义\b",
-            [
-                r"(?:^|\n)(?:词\s*汇\s*表|名词解释)\b",
-                r"(?:^|\n)公司简介\b",
-                r"(?:^|\n)董事长致辞\b",
-                r"(?:^|\n)第\s*[一二三四五六七八九十0-9]{1,3}\s*(?:章|节|部分|篇)\b",
-                r"(?:^|\n)第一[章节]\b",
-                r"(?:^|\n)第一节\b",
-            ],
-        )
-        t = _drop_block(
-            t,
-            r"(?:^|\n)(?:词\s*汇\s*表|名词解释)\b",
-            [
-                r"(?:^|\n)公司简介\b",
-                r"(?:^|\n)董事长致辞\b",
-                r"(?:^|\n)第\s*[一二三四五六七八九十0-9]{1,3}\s*(?:章|节|部分|篇)\b",
-                r"(?:^|\n)第一[章节]\b",
-                r"(?:^|\n)第一节\b",
-            ],
-        )
-
-        # Always strip TOC-like lines as a secondary defense (does not risk deleting whole body).
-        t = _strip_toc_like_lines(t)
-
-        # Start markers (common variants)
-        # NOTE: wording varies a lot across issuers.
-        # Many reports prefix the title with “第X节/章/部分/篇”, e.g. “第一节 董事长致辞”.
-        # We therefore allow an optional section prefix.
-        _sec_prefix = r"(?:第\s*[一二三四五六七八九十0-9]{1,3}\s*(?:章|节|部分|篇)\s*)?"
-
-        start_pats = [
-            # 董事长/主席/董事会主席相关
-            rf"(?:^|\n)\s*{_sec_prefix}(?:董事长\s*致辞|董事长\s*致信|董事长\s*致股东信|董事长\s*致投资者信)\b",
-            rf"(?:^|\n)\s*{_sec_prefix}(?:主席\s*致辞|主席\s*致信)\b",
-            rf"(?:^|\n)\s*{_sec_prefix}(?:董事会\s*主席\s*致辞|董事会\s*主席\s*致信|董事会主席\s*致辞|董事会主席\s*致信)\b",
-
-            # 董事会致辞（有些公司不用“董事长”字样）
-            rf"(?:^|\n)\s*{_sec_prefix}(?:董事会\s*致辞|董事会\s*致信|致\s*董事会\s*的\s*信)\b",
-
-            # 致股东/投资者信（更通用的表述）
-            rf"(?:^|\n)\s*{_sec_prefix}(?:致\s*股东\s*信|致\s*股东\s*的\s*信|致\s*股东\s*函|致\s*投资者\s*信|致\s*投资者\s*函|致\s*股东\s*及\s*投资者\s*(?:信|函)|致\s*全体\s*股东\s*(?:信|函))\b",
-
-            # 兜底：非常短的“致股东/致投资者”标题（有些模板只写这四个字）
-            rf"(?:^|\n)\s*{_sec_prefix}(?:致\s*股东|致\s*投资者)\b",
-        ]
-
-        # End markers: next major chapter/section or obvious non-letter blocks.
-        # NOTE: do NOT use '签名/董事长/日期' as end markers; they are part of the letter.
-        end_pats = [
-            # Hard front-matter blocks
-            r"(?:^|\n)\s*(?:目\s*录|释\s*义|词\s*汇\s*表|名词解释)\b",
-            r"(?:^|\n)\s*重\s*要\s*提\s*示\b",
-
-            # Next major chapter/section/part headings
-            r"(?:^|\n)\s*第\s*[一二三四五六七八九十0-9]{1,3}\s*(?:章|节|部分)\b",
-            r"(?:^|\n)\s*(?:第一|第二|第三|第四|第五|第六|第七|第八|第九|第十|第十一|第十二|第十三)\s*(?:章|节|部分)\b",
-
-            # Common big blocks that indicate we have entered the formal report body
-            r"(?:^|\n)\s*(?:公司概况|公司简介|公司基本情况|董事会报告|管理层讨论与分析|经营情况讨论与分析)\b",
-        ]
-
-        # If TOC suggests a chairman letter exists but we fail to extract a valid body,
-        # return a hint string so downstream report can prompt the user to open the PDF.
-        toc_suggests_letter = False
-        if re.search(r"董事长致辞|董事会致辞|主席致辞|致股东信|致投资者信", front):
-            # only treat as a hint when TOC-like structure exists
-            if re.search(r"目\s*录", front) or re.search(r"[\.·…]{4,}.*\d{1,4}\s*$", front, flags=re.MULTILINE):
-                toc_suggests_letter = True
-
-
-        best = None
-        best_start = None
-
-        # We must NOT pick TOC entries. Some PDFs contain a TOC line like “董事长致辞 …… 7”
-        # within the first pages. Those matches are usually very short. Therefore:
-        # - scan all occurrences (re.finditer) rather than the first;
-        # - reject TOC-like lines;
-        # - require substantial body length (>= 400 chars after whitespace removal).
-        for sp in start_pats:
-            for m in re.finditer(sp, t):
-                start = m.start()
-
-                # Avoid grabbing reference sentence like “详见第三节…敬请查阅”
-                ls = t.rfind("\n", 0, start)
-                le = t.find("\n", start)
-                line = t[(ls + 1 if ls >= 0 else 0):(le if le >= 0 else len(t))].strip()
-                compact = re.sub(r"\s+", "", line)
-                # Reject TOC-like entries such as “董事长致辞……12”
-                if re.search(r"[\.·…]{4,}\s*\d{1,4}\s*$", line):
-                    toc_suggests_letter = True
-                    continue
-                # Also reject lines that end with a small page number (but allow years)
-                if re.search(r"\s\d{1,4}\s*$", line) and (not re.search(r"(?:19|20)\d{2}\s*$", line)):
-                    toc_suggests_letter = True
-                    continue
-                if ("详见" in compact or "敬请" in compact or "查阅" in compact) and len(compact) > 20:
-                    continue
-
-                tail = t[m.end():]
-                end = None
-                for ep in end_pats:
-                    me = re.search(ep, tail)
-                    if not me:
-                        continue
-                    cand = m.end() + me.start()
-                    if cand <= start + 120:
-                        continue
-                    end = cand if end is None else min(end, cand)
-
-                if end is None:
-                    end = len(t)
-
-                chunk = t[start:end].strip()
-                chunk = _refine_letter_tail(chunk)
-                # Reject TOC-only or extremely short hits. A real chairman letter is almost never < 400 chars.
-                if len(re.sub(r"\s+", "", chunk)) < 400:
-                    continue
-                # Must contain substantial body text beyond the heading itself
-                if len(chunk) < 400:
-                    continue
-                # If it looks like only one line / no paragraphs, it is likely still TOC/heading noise
-                if chunk.count("\n") < 2 and len(chunk) < 900:
-                    continue
-
-                if best is None or (best_start is not None and start < best_start):
-                    best = chunk
-                    best_start = start
-
-        # Second-pass fallback: if we saw TOC hints but didn't get a valid body,
-        # retry on the original `front` with TOC-like lines stripped (without aggressive block deletion).
-        if not best and toc_suggests_letter:
-            t2 = _strip_toc_like_lines(front)
-            for sp in start_pats:
-                for m in re.finditer(sp, t2):
-                    start = m.start()
-                    ls = t2.rfind("\n", 0, start)
-                    le = t2.find("\n", start)
-                    line = t2[(ls + 1 if ls >= 0 else 0):(le if le >= 0 else len(t2))].strip()
-                    if re.search(r"[\.·…]{4,}\s*\d{1,4}\s*$", line):
-                        continue
-
-                    tail = t2[m.end():]
-                    end = None
-                    for ep in end_pats:
-                        me = re.search(ep, tail)
-                        if not me:
-                            continue
-                        cand = m.end() + me.start()
-                        if cand <= start + 120:
-                            continue
-                        end = cand if end is None else min(end, cand)
-                    if end is None:
-                        end = len(t2)
-
-                    chunk = t2[start:end].strip()
-                    chunk = _refine_letter_tail(chunk)
-                    if len(re.sub(r"\s+", "", chunk)) < 400:
-                        continue
-                    if chunk.count("\n") < 2 and len(chunk) < 900:
-                        continue
-                    best = chunk
-                    best_start = start
-                    break
-                if best:
-                    break
-
-        # Truncate extremely long letters but keep a larger tail (signature block is usually at the end)
-        if not best:
-            if toc_suggests_letter:
-                return "[CHAIRMAN_LETTER_HINT] 目录显示存在董事长/董事会/主席致辞或致股东(投资者)信，但正文抽取失败；建议打开原PDF查看原文与落款。"
-            return None
-
-        if len(best) > 50000:
-            head = best[:46000].rstrip()
-            tail = best[-12000:].lstrip()
-            best = head + "\n\n[...TRUNCATED...]\n\n" + tail
-
-        return best
 
     def extract_text(self, pdf_path, page_numbers=None):
         # 使用 pdfminer 按页提取（支持只读指定页）
@@ -1694,122 +712,17 @@ class AnnualReportParser:
         return self.normalize(text)
 
     def build_fallback_mda(self, pdf_path: str, reason: str, page_count: int) -> dict:
-        """Fallback payload for DB so the report is not ignored even if MDA parsing fails.
-
-        IMPORTANT:
-        - Do NOT dump front-matter (重要提示/目录/释义) into summaries.
-        - If parsing fails, prefer telling the user to read the original PDF.
-        """
-        # Fast-path: for image-heavy PDFs we intentionally skip deep extraction to save time.
-        if reason == "image_heavy_skip":
-            pdf_name = os.path.basename(pdf_path)
-            base = f"[PARSE_FAILED] reason={reason} pages={page_count}\n请查看原PDF：{pdf_name}"
-            hint = "[PARSE_SKIPPED_IMAGE_HEAVY] 该PDF图文混排/图片占比高，文本抽取成本很高且成功率低；建议直接打开原PDF查看。"
-            return {
-                "industry": None,
-                "business": None,
-                "future": None,
-                "chairman_letter": hint,
-                "full_mda": base,
-            }
-
-        excerpt = ""
-        try:
-            probe_pages = list(range(0, min(40, max(int(page_count or 0), 1))))
-            probe = self.extract_text(pdf_path, page_numbers=probe_pages) or ""
-            t = probe
-
-            # drop blocks helper
-            def _drop_block(src: str, start_pat: str, end_pats: list[str]) -> str:
-                blk = self._extract_between_markers(src, start_pat, end_pats)
-                return src.replace(blk, "") if blk else src
-
-            # remove “重要提示/目录/释义/词汇表”
-            t = _drop_block(
-                t,
-                r"(?:^|\n)重\s*要\s*提\s*示\b",
-                [
-                    r"(?:^|\n)目\s*录\b",
-                    r"(?:^|\n)释\s*义\b",
-                    r"(?:^|\n)词\s*汇\s*表\b",
-                    r"(?:^|\n)第[一二三四五六七八九十]+章\b",
-                    r"(?:^|\n)第一[章节]\b",
-                    r"(?:^|\n)第二[章节]\b",
-                    r"(?:^|\n)第三[章节]\b",
-                ],
-            )
-            t = _drop_block(t, r"(?:^|\n)目\s*录\b", [r"(?:^|\n)第一[章节]\b", r"(?:^|\n)第一节\b"])
-            t = _drop_block(t, r"(?:^|\n)释\s*义\b", [r"(?:^|\n)(?:词\s*汇\s*表|第一[章节]|第一节)\b"])
-            t = _drop_block(t, r"(?:^|\n)词\s*汇\s*表\b", [r"(?:^|\n)(?:第一[章节]|第一节)\b"])
-
-            # try to find a real-content anchor
-            anchors = [
-                r"(?:^|\n)第三章\b",
-                r"(?:^|\n)第三节\s*管理层讨论与分析\b",
-                r"(?:^|\n)第一节\s*公司业务概要\b",
-                r"(?:^|\n)(?:董事会报告|董事会工作报告|董事会报告书)\b",
-                r"(?:^|\n)管理层综述\b",
-            ]
-            cut = None
-            for ap in anchors:
-                m = re.search(ap, t)
-                if m:
-                    cut = m.start()
-                    break
-            if cut is not None:
-                t = t[cut:].strip()
-
-            # if still looks like front-matter, abandon
-            if re.match(r"^(重\s*要\s*提\s*示|目\s*录|释\s*义|词\s*汇\s*表)\b", t):
-                t = ""
-
-            if t and len(t) >= 300:
-                excerpt = t[:6000].rstrip()
-
-        except Exception:
-            excerpt = ""
-
-        pdf_name = os.path.basename(pdf_path)
-        base = f"[PARSE_FAILED] reason={reason} pages={page_count}\n请查看原PDF：{pdf_name}"
-
-        # If we managed to get any real-content excerpt, surface it in `business`
-        # so the daily report doesn't look empty. If we have no excerpt, keep it None.
-        biz = None
-        if excerpt:
-            biz = "（解析失败：以下为正文片段，可能不完整；建议打开原PDF核对）\n\n" + excerpt
-
-        full = base
-        if biz:
-            full = base + "\n\n" + biz
-
-        return {
-            "industry": None,
-            "business": biz,
-            "future": None,
-            "chairman_letter": self.extract_chairman_letter(pdf_path, max_pages=25),
-            "full_mda": full,
-        }
+        return build_fallback_mda_impl(
+            pdf_path,
+            reason=reason,
+            page_count=page_count,
+            extract_text_fn=self.extract_text,
+            extract_between_markers_fn=self._extract_between_markers,
+            extract_chairman_letter_fn=self.extract_chairman_letter,
+        )
 
     def _slice_to_next_bracket_heading(self, text: str, start_idx: int):
-        """
-        从（X）/ (X) 这类括号小标题开始切，到下一条同级括号小标题或下一条“一级大标题（序号+、）”。
-        """
-        if start_idx is None or start_idx < 0:
-            return None
-
-        next_sub = None
-        m_sub = re.search(r"(?:\n\s*[（(][一二三四五六七八九十0-9]{1,3}[）)])", text[start_idx + 1:])
-        if m_sub:
-            next_sub = start_idx + 1 + m_sub.start()
-
-        next_major = None
-        m_major = re.search(r"(?:\n\s*(?:[一二三四五六七八九十]{1,3}|\d{1,2})、)", text[start_idx + 1:])
-        if m_major:
-            next_major = start_idx + 1 + m_major.start()
-
-        candidates = [p for p in (next_sub, next_major) if p is not None]
-        end_idx = min(candidates) if candidates else len(text)
-        return text[start_idx:end_idx].strip()
+        return slice_to_next_bracket_heading_impl(text, start_idx)
 
     def normalize(self, text):
         # 统一换行/去除不可见分页符
@@ -2309,297 +1222,36 @@ class AnnualReportParser:
         }
 
     def _slice_to_next_heading_with_title_keywords(self, text, start_idx, title_keywords):
-        """
-        从 start_idx 切到“下一条标题”，且该标题行的标题部分包含 title_keywords 之一。
-        同时支持：
-        - 一级标题：二、xxx / 2、xxx
-        - 括号小标题：（三）xxx / (3)xxx
-        """
-        if start_idx is None or start_idx < 0:
-            return None
-
-        candidates = []
-
-        # A) 一级标题：二、xxx
-        for m in re.finditer(
-            r"(?:^|\n)\s*([一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]\s*([^\n]{1,80})",
-            text[start_idx + 1:]
-        ):
-            title = m.group(2)
-            if any(kw in title for kw in title_keywords):
-                candidates.append(start_idx + 1 + m.start())
-                break
-
-        # B) 括号小标题：（三）xxx / (3)xxx
-        for m in re.finditer(
-            r"(?:^|\n)\s*[（(][一二三四五六七八九十0-9]{1,3}[）)]\s*([^\n]{1,80})",
-            text[start_idx + 1:]
-        ):
-            title = m.group(1)
-            if any(kw in title for kw in title_keywords):
-                candidates.append(start_idx + 1 + m.start())
-                break
-
-        if not candidates:
-            return None
-
-        end_idx = min(candidates)
-        return text[start_idx:end_idx].strip()
+        return slice_to_next_heading_with_title_keywords_impl(text, start_idx, title_keywords)
 
     def _slice_to_next_major_heading(self, text, start_idx):
-        """
-        从 start_idx 切到“下一条重大一级标题”（标题行包含 MAJOR_HEADING_KEYWORDS）。
-        目的：避免把同一段里的城市/地区小标题（三、深圳…）当作章节结束。
-        若找不到重大标题，则返回 None 让调用方自行兜底。
-        """
-        if start_idx is None or start_idx < 0:
-            return None
-
-        # 形如：三、核心竞争力分析 / 四、主营业务分析 / 十一、公司未来发展的展望
-        heading_iter = re.finditer(
-            r"(?:\n\s*([一二三四五六七八九十]{1,3}|\d{1,2})、([^\n]{1,60}))",
-            text[start_idx + 1:]
-        )
-
-        for m in heading_iter:
-            title = m.group(2)
-            if any(kw in title for kw in self.MAJOR_HEADING_KEYWORDS):
-                end_idx = start_idx + 1 + m.start()
-                return text[start_idx:end_idx].strip()
-
-        return None
+        return slice_to_next_major_heading_impl(text, start_idx, self.MAJOR_HEADING_KEYWORDS)
 
     def _next_ordinal_candidates(self, current_ordinal: str):
-        """
-        给定当前一级序号（中文或阿拉伯），返回可能的“下一个一级序号”候选列表。
-        例如：'二' -> ['三', '3']；'11' 或 '十一' -> ['十二', '12']。
-        """
-        cn_list = ["一","二","三","四","五","六","七","八","九","十",
-                   "十一","十二","十三","十四","十五","十六","十七","十八","十九","二十"]
-        cn_to_ar = {"一":"1","二":"2","三":"3","四":"4","五":"5","六":"6","七":"7","八":"8","九":"9","十":"10",
-                    "十一":"11","十二":"12","十三":"13","十四":"14","十五":"15","十六":"16","十七":"17","十八":"18","十九":"19","二十":"20"}
-        ar_to_cn = {v:k for k,v in cn_to_ar.items()}
-
-        cur_cn = current_ordinal
-        cur_ar = None
-
-        # 标准化：如果输入是阿拉伯数字，转成中文索引
-        if re.fullmatch(r"\d{1,2}", current_ordinal):
-            cur_ar = current_ordinal
-            cur_cn = ar_to_cn.get(current_ordinal)
-
-        if cur_cn in cn_list:
-            idx = cn_list.index(cur_cn)
-            if idx + 1 < len(cn_list):
-                nxt_cn = cn_list[idx + 1]
-                nxt_ar = cn_to_ar.get(nxt_cn)
-                return [nxt_cn, nxt_ar] if nxt_ar else [nxt_cn]
-
-        # 找不到就不给候选
-        return []
+        return next_ordinal_candidates_impl(current_ordinal)
 
     def _slice_to_next_ordinal(self, text, start_idx, current_ordinal: str):
-        """
-        从 start_idx 开始切片到“下一一级序号”（例如 二、 -> 三、；十一、 -> 十二、）。
-        这样不会被正文中的“一、/1、”等项目符号截断。
-        """
-        if start_idx is None or start_idx < 0:
-            return None
-
-        # 先尝试按“重大标题”结束，避免被城市/地区小标题截断
-        major_slice = self._slice_to_next_major_heading(text, start_idx)
-        if major_slice:
-            return major_slice
-
-        candidates = self._next_ordinal_candidates(current_ordinal)
-
-        def _cand_regex(c: str) -> str:
-            """Build a tolerant regex for next ordinal.
-            - For Arabic numbers: exact match.
-            - For Chinese numerals like '十二': allow optional whitespace/newlines between characters (e.g. '十\n二').
-            """
-            if re.fullmatch(r"\d{1,2}", c):
-                return re.escape(c)
-            # Allow whitespace/newlines between each Chinese numeral character
-            return r"\\s*".join(re.escape(ch) for ch in c)
-
-        end_positions = []
-        for cand in candidates:
-            if not cand:
-                continue
-            cand_pat = _cand_regex(cand)
-            # IMPORTANT: Some PDFs may emit headings without a preceding newline in extracted text.
-            # So we must match both start-of-string and newline.
-            m = re.search(rf"(?:^|\n)\s*{cand_pat}\s*、", text[start_idx + 1:])
-            if m:
-                end_positions.append(start_idx + 1 + m.start())
-
-        # Fallback: if the next-ordinal marker is present but formatting is weird,
-        # try a more permissive scan for the next ordinal line.
-        if not end_positions and candidates:
-            for cand in candidates:
-                if not cand:
-                    continue
-                cand_pat = _cand_regex(cand)
-                m2 = re.search(rf"{cand_pat}\s*、", text[start_idx + 1:])
-                if m2:
-                    end_positions.append(start_idx + 1 + m2.start())
-
-        end_idx = min(end_positions) if end_positions else len(text)
-        return text[start_idx:end_idx].strip()
+        return slice_to_next_ordinal_impl(text, start_idx, current_ordinal, self.MAJOR_HEADING_KEYWORDS)
 
     def extract_section_by_ordinal(self, text, ordinal_cn, keyword_fallback=None):
-        """
-        按“同级序号”提取段落：
-        - 起始优先匹配：二、 / 2、 （一级）
-        - 仅当找不到一级时，才尝试： （二）/(二) 这类括号形式（有些报告一级也用括号）
-        - 结束仅识别同级：一、二、三… / 1、2、3…（不把（ 一 ）当作结束）
-        """
-        cn_to_arabic = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
-                        "六": "6", "七": "7", "八": "8", "九": "9", "十": "10",
-                        "十一": "11", "十二": "12"}
-
-        start_idx = None
-
-        # 1) 一级：中文序号 + 顿号（最可靠，避免误命中（二）子标题）
-        m1 = re.search(rf"(?:^|\n)\s*{ordinal_cn}、", text)
-        if m1:
-            start_idx = m1.start()
-        else:
-            # 2) 一级：阿拉伯数字 + 顿号
-            arabic = cn_to_arabic.get(ordinal_cn)
-            if arabic:
-                m2 = re.search(rf"(?:^|\n)\s*{arabic}、", text)
-                if m2:
-                    start_idx = m2.start()
-
-        # 3) 仍找不到：才尝试括号形式（有些报告一级标题可能写成（十一））
-        if start_idx is None:
-            m3 = re.search(rf"(?:^|\n)\s*(?:（{ordinal_cn}）|\({ordinal_cn}\))", text)
-            if m3:
-                start_idx = m3.start()
-            else:
-                arabic = cn_to_arabic.get(ordinal_cn)
-                if arabic:
-                    m4 = re.search(rf"(?:^|\n)\s*(?:（{arabic}）|\({arabic}\))", text)
-                    if m4:
-                        start_idx = m4.start()
-
-        # 4) 关键词兜底
-        if start_idx is None and keyword_fallback:
-            for kw in keyword_fallback:
-                mk = re.search(rf"(?:^|\n)\s*{kw}", text)
-                if mk:
-                    start_idx = mk.start()
-                    break
-
-        return self._slice_to_next_ordinal(text, start_idx, ordinal_cn)
+        return extract_section_by_ordinal_impl(
+            text,
+            ordinal_cn,
+            keyword_fallback=keyword_fallback,
+            major_heading_keywords=self.MAJOR_HEADING_KEYWORDS,
+        )
 
     def extract_section_by_keywords(self, text, keywords, fallback_ordinals=None, end_title_keywords=None):
-        """
-        通过“一级标题行（序号 + 顿号）+ 关键词”定位并提取整段，并按该序号切到下一序号。
-        关键：结束边界是“下一一级序号”，避免被正文里的项目符号截断。
-        """
-        for kw in keywords:
-            # Support regex keywords by prefix: REGEX:<pattern>
-            if isinstance(kw, str) and kw.startswith("REGEX:"):
-                kw_pat = kw[len("REGEX:"):]
-            else:
-                kw_pat = re.escape(str(kw))
-
-            m = re.search(
-                rf"(?:^|\n)\s*([一二三四五六七八九十]{{1,3}}|\d{{1,2}})[、\.．:：]\s*[^\n]*{kw_pat}[^\n]*",
-                text
-            )
-            if m:
-                start = m.start()
-                ordinal = m.group(1)
-
-                # If end_title_keywords is provided: only stop at a major heading whose title contains any of these keywords.
-                # If not found, fall back to slicing by next same-level ordinal.
-                if end_title_keywords:
-                    sliced = self._slice_to_next_heading_with_title_keywords(text, start, end_title_keywords)
-                    if sliced:
-                        return sliced
-                    return self._slice_to_next_ordinal(text, start, ordinal)
-
-                return self._slice_to_next_ordinal(text, start, ordinal)
-
-        # 兼容“2.3.1 2026年业务展望/2．3．1 …”这类点分数字标题（部分非标年报，如中兴通讯）
-        for kw in keywords:
-            if isinstance(kw, str) and kw.startswith("REGEX:"):
-                kw_pat = kw[len("REGEX:"):]
-            else:
-                kw_pat = re.escape(str(kw))
-
-            # 形如：2.3.1 2026年业务展望 / 2．3．1 2026年业务展望
-            m = re.search(
-                rf"(?:^|\n)\s*(\d+(?:[\.．]\d+){{1,3}})\s*[、\.．:：]?\s*[^\n]*{kw_pat}[^\n]*",
-                text
-            )
-            if not m:
-                continue
-
-            start = m.start()
-
-            # 若提供了 end_title_keywords：优先用“后续大章标题”来截断
-            if end_title_keywords:
-                sliced = self._slice_to_next_heading_with_title_keywords(text, start, end_title_keywords)
-                if sliced:
-                    return sliced
-
-            # 否则/或未命中：用“下一个点分标题/一级序号标题/第X章(节)”中的最早者截断
-            tail = text[start + 1:]
-            end_candidates: list[int] = []
-
-            # A) 下一个点分标题（任意 1~3 级，如 2.3.2 / 2.4 / 3.1）
-            m_dot = re.search(r"(?:^|\n)\s*\d+(?:[\.．]\d+){1,3}\b", tail)
-            if m_dot:
-                end_candidates.append(start + 1 + m_dot.start())
-
-            # B) 下一个一级中文/阿拉伯序号标题：二、 / 12、（注意不要把正文项目符号误判为大章；这里只作为兜底）
-            m_ord = re.search(r"(?:^|\n)\s*(?:[一二三四五六七八九十]{1,3}|\d{1,2})[、\.．:：]", tail)
-            if m_ord:
-                end_candidates.append(start + 1 + m_ord.start())
-
-            # C) 下一个“第X章/节”
-            m_ch = re.search(r"(?:^|\n)\s*第\s*[一二三四五六七八九十]{1,3}\s*[章节]", tail)
-            if m_ch:
-                end_candidates.append(start + 1 + m_ch.start())
-
-            end_idx = min(end_candidates) if end_candidates else len(text)
-            return text[start:end_idx].strip()
-
-        # 兼容括号小标题：如（三）所处行业情况 / (一) 主要业务 / （三）行业情况说明
-        for kw in keywords:
-            if isinstance(kw, str) and kw.startswith("REGEX:"):
-                kw_pat = kw[len("REGEX:"):]
-            else:
-                kw_pat = re.escape(str(kw))
-
-            m = re.search(
-                rf"(?:^|\n)\s*[（(]([一二三四五六七八九十0-9]{{1,3}})[）)]\s*[^\n]*{kw_pat}[^\n]*",
-                text
-            )
-            if m:
-                start = m.start()
-                sliced = self._slice_to_next_bracket_heading(text, start)
-                if sliced:
-                    return sliced
-                return text[start:].strip()
-
-        # 兜底：按候选序号（注意这会依赖报告结构，优先级放后面）
-        if fallback_ordinals:
-            for o in fallback_ordinals:
-                sec = self.extract_section_by_ordinal(text, o)
-                if sec:
-                    return sec
-        return None
+        return extract_section_by_keywords_impl(
+            text,
+            keywords,
+            fallback_ordinals=fallback_ordinals,
+            end_title_keywords=end_title_keywords,
+            major_heading_keywords=self.MAJOR_HEADING_KEYWORDS,
+        )
 
     def extract_section(self, text, title):
-        pattern = rf"{title}[\s\S]*?(?=\n[一二三四五六七八九十]+、|\Z)"
-        match = re.search(pattern, text)
-        return match.group(0).strip() if match else None
+        return extract_section_impl(text, title)
 
 
 # ===============================
@@ -2640,67 +1292,42 @@ def main():
     download_dir = str(DOWNLOADS_DIR)
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-    db = MySQLClient()
+    # ------------------------------------------------------------------
+    # Phase 0: 初始化运行上下文
+    # - 数据库客户端
+    # - 解析器
+    # - 行业补充客户端
+    # ------------------------------------------------------------------
+    db = MySQLClient(conf_dir=CONF_DIR)
     parser = AnnualReportParser()
     industry_client = JoinQuantIndustryClient()
 
-    # 最近N天窗口（默认30天）；可在 config.ini 里配置：
-    # [crawler]
-    # days_back = 30
-    cfg = configparser.ConfigParser()
-    cfg.read(CONF_DIR / "config.ini", encoding="utf-8")
-    days_back = 30
-    reparse_existing = True  # 默认允许覆盖更新，方便你迭代解析逻辑
-    use_last_crawl = True  # 默认使用“上次抓取截止时间”做增量窗口，避免重复爬取
-    last_crawl_state_file = LAST_CRAWL_STATE_FILE
-    company_mode = bool(getattr(args, "single_company", False))
-    stock_code_filter = _normalize_stock_code(args.stock_code) if company_mode else None
-    if company_mode and not stock_code_filter:
-        stock_code_filter = "600519"
-    company_years = max(1, int(args.years or 10))
-    current_year = datetime.now().year
-    min_report_year = current_year - company_years + 1
-    try:
-        if cfg.has_section("crawler") and cfg.get("crawler", "days_back", fallback=""):
-            days_back = int(cfg.get("crawler", "days_back"))
-        if cfg.has_section("crawler"):
-            reparse_existing = cfg.getboolean("crawler", "reparse_existing", fallback=True)
-            use_last_crawl = cfg.getboolean("crawler", "use_last_crawl", fallback=True)
-            # 可选：自定义状态文件路径（相对 conf/config.ini 的项目根目录）
-            p = cfg.get("crawler", "last_crawl_state_file", fallback="").strip()
-            if p:
-                last_crawl_state_file = (PROJECT_ROOT / p).resolve()
-    except Exception:
-        days_back = 30
-        reparse_existing = True
-        use_last_crawl = True
-        last_crawl_state_file = LAST_CRAWL_STATE_FILE
-        company_mode = bool(getattr(args, "single_company", False))
-        stock_code_filter = _normalize_stock_code(args.stock_code) if company_mode else None
-        if company_mode and not stock_code_filter:
-            stock_code_filter = "600519"
-        company_years = max(1, int(args.years or 10))
-        current_year = datetime.now().year
-        min_report_year = current_year - company_years + 1
-
-    if company_mode:
-        use_last_crawl = False
-        reparse_existing = True
-
-    # ===============================
-    # 性能配置（并行下载/解析）
-    # ===============================
-    # 解析（pdfminer/pdfplumber）CPU 开销较大，用多进程收益明显；下载用线程即可。
-    max_workers_download = 8
-    max_workers_parse = max(1, min((os.cpu_count() or 4), 8))
-    parse_backend = "process"  # process | thread
-    try:
-        if cfg.has_section("perf"):
-            max_workers_download = int(cfg.get("perf", "max_workers_download", fallback=str(max_workers_download)))
-            max_workers_parse = int(cfg.get("perf", "max_workers_parse", fallback=str(max_workers_parse)))
-            parse_backend = cfg.get("perf", "parse_backend", fallback=parse_backend).strip().lower() or parse_backend
-    except Exception:
-        pass
+    # ------------------------------------------------------------------
+    # Phase 1: 读取配置并解析运行模式
+    # - 全市场增量
+    # - 单公司历史模式
+    #
+    # 后续拆分建议：
+    # - 已提炼到 `reportclaw.runtime_config.load_main_runtime_config()`
+    # - 入口只消费 runtime config，不再关心细节来源
+    # ------------------------------------------------------------------
+    _cfg, runtime = load_main_runtime_config(
+        args,
+        project_root=PROJECT_ROOT,
+        conf_dir=CONF_DIR,
+        default_state_file=LAST_CRAWL_STATE_FILE,
+    )
+    days_back = runtime.days_back
+    reparse_existing = runtime.reparse_existing
+    use_last_crawl = runtime.use_last_crawl
+    last_crawl_state_file = runtime.last_crawl_state_file
+    company_mode = runtime.company_mode
+    stock_code_filter = runtime.stock_code_filter
+    company_years = runtime.company_years
+    min_report_year = runtime.min_report_year
+    max_workers_download = runtime.max_workers_download
+    max_workers_parse = runtime.max_workers_parse
+    parse_backend = runtime.parse_backend
 
     session = requests.Session()
     session.headers.update({
@@ -2714,6 +1341,12 @@ def main():
 
     base_url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
 
+    # ------------------------------------------------------------------
+    # Phase 2: 计算本次抓取窗口
+    # - 默认 days_back 窗口
+    # - 如启用 use_last_crawl，则与状态文件做 max()
+    # - 单公司模式按年份展开，不走增量截断
+    # ------------------------------------------------------------------
     # CNINFO 的 seDate/endDate 在“当天新增披露”场景下经常会漏（按日边界/索引延迟）。
     # 经验最稳：把查询窗口的 end 向后延 1 天（明天），确保抓到“今天新增但接口尚未完全可见”的公告。
     # 注意：增量状态仍以 real_end_date（当前时间）持久化，避免把未来时间写入 last_crawl_end_iso。
@@ -2736,283 +1369,107 @@ def main():
     start_ts = start_date.timestamp()
     end_ts = query_end_date.timestamp()
 
-    date_range = f"{start_date.strftime('%Y-%m-%d')}~{query_end_date.strftime('%Y-%m-%d')}"
-    if company_mode:
-        company_column, company_plate = _guess_cninfo_exchange(stock_code_filter)
-        columns = [company_column]
-        print(
-            f"[crawler] company_mode=true stock={stock_code_filter}, years={company_years}, "
-            f"report_year>={min_report_year}, window={date_range}, exchange={company_column}"
-        )
-    else:
-        if use_last_crawl:
-            print(f"[crawler] use_last_crawl=true, state={last_crawl_state_file}, window={date_range}")
-        columns = ["szse", "sse"]  # 全市场：深交所 + 上交所
+    # ------------------------------------------------------------------
+    # Phase 3: 枚举交易所分页接口，收集候选公告元数据
+    #
+    # 这一段是典型的“crawler 层”逻辑：
+    # - 翻页请求 cninfo
+    # - 基于标题/时间窗口/股票代码过滤
+    # - 组装后续下载所需元数据
+    #
+    # 后续拆分建议：
+    # - extract fetch_candidate_announcements(...)
+    # - 返回统一的 candidate dict 列表
+    # ------------------------------------------------------------------
+    candidates = fetch_candidate_announcements(
+        session=session,
+        base_url=base_url,
+        download_dir=download_dir,
+        start_date=start_date,
+        query_end_date=query_end_date,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        company_mode=company_mode,
+        stock_code_filter=stock_code_filter,
+        company_years=company_years,
+        min_report_year=min_report_year,
+        use_last_crawl=use_last_crawl,
+        last_crawl_state_file=last_crawl_state_file,
+        post_timeout=POST_TIMEOUT,
+        max_retry=MAX_RETRY,
+    )
 
-    # 先收集候选年报（只收集元数据，不在分页循环里做重活）
-    candidates: list[dict] = []
-
-    for col in columns:
-        page = 1
-        while True:
-            plate = company_plate if company_mode else ("sz" if col == "szse" else "sh")  # 深市/沪市
-            print(f"[{col}] 拉取第 {page} 页...")
-            data = {
-                "pageNum": page,
-                "pageSize": 30,
-                "column": col,          # szse / sse
-                "plate": plate,         # sz / sh
-                "tabName": "fulltext",
-                "category": "category_ndbg_szsh;",
-                "seDate": date_range,
-                "isHLtitle": "false",
-                "searchkey": stock_code_filter if company_mode else "年度报告",
-                "secid": ""
-            }
-
-            result = None
-            for attempt in range(1, MAX_RETRY + 1):
-                try:
-                    r = session.post(base_url, data=data, timeout=POST_TIMEOUT)
-                    r.raise_for_status()
-                    result = r.json()
-                    break
-                except Exception as e:
-                    print(f"[{col}] 第 {page} 页请求失败 attempt={attempt}/{MAX_RETRY}: {e}")
-                    if attempt == MAX_RETRY:
-                        print(f"[{col}] 连续失败，跳过该交易所后续分页。")
-                        result = {"announcements": []}
-                    else:
-                        time.sleep(1.0 * attempt)
-
-            announcements = result.get("announcements") or []
-            print(f"[{col}] 第 {page} 页返回 {len(announcements)} 条公告")
-
-            # 若服务端忽略 seDate，分页会无限向历史拉取。我们用 announcementTime 强制截断。
-            oldest_ts = None
-            newest_ts = None
-            for a in announcements:
-                t = a.get("announcementTime")
-                ts = None
-                if isinstance(t, int):
-                    ts = t / 1000 if t > 1e12 else t
-                elif isinstance(t, str):
-                    if t.isdigit():
-                        ti = int(t)
-                        ts = ti / 1000 if ti > 1e12 else ti
-                    else:
-                        try:
-                            ts = datetime.strptime(t[:10], "%Y-%m-%d").timestamp()
-                        except Exception:
-                            ts = None
-                if ts is None:
-                    continue
-                oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
-                newest_ts = ts if newest_ts is None else max(newest_ts, ts)
-
-            if oldest_ts is not None and oldest_ts < start_ts:
-                print(
-                    f"[{col}] 已到达时间窗口下界（本页最老 {datetime.fromtimestamp(oldest_ts).strftime('%Y-%m-%d')} < {start_date.strftime('%Y-%m-%d')}），处理完本页后停止分页。"
-                )
-                stop_after_page = True
-            else:
-                stop_after_page = False
-
-            if newest_ts is not None and newest_ts < start_ts:
-                print(
-                    f"[{col}] 本页最新也早于时间窗口（{datetime.fromtimestamp(newest_ts).strftime('%Y-%m-%d')} < {start_date.strftime('%Y-%m-%d')}），立即停止分页。"
-                )
-                break
-
-            if page >= 50:
-                print(f"[{col}] 已达到最大页数上限 50，停止分页（防止异常无限分页）。")
-                break
-
-            if not announcements:
-                break
-
-            # 收集候选
-            if col == "sse" and page == 1:
-                for a in announcements:
-                    print("[SSE DEBUG]", a.get("secCode"), a.get("secName"), a.get("announcementTitle"), a.get("announcementTime"))
-
-            for ann in announcements:
-                title = ann.get("announcementTitle") or ""
-
-                # 过滤：必须是年度报告（排除摘要）
-                if "年度报告" not in title:
-                    continue
-                if "摘要" in title:
-                    continue
-                if "关于" in title and "年度报告" not in title.split("关于")[0]:
-                    continue
-
-                year_match = re.search(r"(20\d{2})\s*年?\s*年度报告", title)
-                if year_match:
-                    year = int(year_match.group(1))
-                else:
-                    m0 = re.match(r"^(20\d{2})", title)
-                    if not m0:
-                        continue
-                    year = int(m0.group(1))
-
-                if company_mode and year < min_report_year:
-                    continue
-
-                stock_code = ann.get("secCode")
-                stock_name = ann.get("secName")
-                timestamp = ann.get("announcementTime")
-
-                if stock_code is not None:
-                    stock_code = str(stock_code).strip().zfill(6)
-
-                if company_mode and stock_code != stock_code_filter:
-                    continue
-
-                if not stock_code or not stock_name or not timestamp:
-                    continue
-                # Exclude B-shares: SZ B-share uses 200xxx/201xxx, SH B-share uses 900xxx.
-                # These are typically bilingual/English-heavy PDFs and not part of the A-share universe.
-                if str(stock_code).startswith(("200", "201", "900")):
-                    continue
-
-                if isinstance(timestamp, int):
-                    ts = timestamp / 1000 if timestamp > 1e12 else timestamp
-                    publish_dt = datetime.fromtimestamp(ts)
-                    publish_date = publish_dt.strftime("%Y-%m-%d")
-                else:
-                    publish_date = str(timestamp)[:10]
-                    try:
-                        publish_dt = datetime.strptime(publish_date, "%Y-%m-%d")
-                        ts = publish_dt.timestamp()
-                    except Exception:
-                        ts = None
-
-                # 强制时间窗口过滤
-                if ts is not None:
-                    if ts < start_ts or ts > end_ts:
-                        continue
-                else:
-                    try:
-                        pd = datetime.strptime(publish_date, "%Y-%m-%d").timestamp()
-                    except Exception:
-                        continue
-                    if pd < start_ts or pd > end_ts:
-                        continue
-
-                adj_url = ann.get("adjunctUrl") or ""
-                if not adj_url:
-                    continue
-                file_name = adj_url.split("/")[-1]
-                file_path = os.path.join(download_dir, file_name)
-
-                candidates.append({
-                    "col": col,
-                    "title": title,
-                    "stock_code": stock_code,
-                    "stock_name": stock_name,
-                    "year": year,
-                    "publish_date": publish_date,
-                    "ts": ts,
-                    "ann": ann,
-                    "file_path": file_path,
-                })
-
-            if stop_after_page:
-                break
-
-            page += 1
-            time.sleep(0.6)
-
-    # 候选去重：同 (stock_code, year) 若出现多个，优先取时间更晚的（修订/更正更可能在后）
-    dedup: dict[tuple[str, int], dict] = {}
-    for c in candidates:
-        k = (c["stock_code"], int(c["year"]))
-        if k not in dedup:
-            dedup[k] = c
-            continue
-        # compare ts if available
-        old = dedup[k]
-        if (c.get("ts") or 0) >= (old.get("ts") or 0):
-            dedup[k] = c
-
-    candidates = list(dedup.values())
-    candidates.sort(key=lambda x: (x.get("ts") or 0), reverse=True)
+    # ------------------------------------------------------------------
+    # Phase 4: 候选去重
+    # - 逻辑唯一键：(stock_code, report_year)
+    # - 同一年出现多个版本时，优先保留披露时间更晚的记录
+    #
+    # 这是一个很适合独立抽成纯函数的步骤，拆分成本低，回归也容易。
+    # ------------------------------------------------------------------
+    candidates = dedupe_candidates(candidates)
     print(f"[perf] candidates(after dedup)={len(candidates)}")
 
-    # 并行下载缺失 PDF
-    to_download: list[tuple[dict, str, requests.Session, tuple[int, int], int]] = []
-    for c in candidates:
-        if not os.path.exists(c["file_path"]):
-            to_download.append((c["ann"], c["file_path"], session, GET_TIMEOUT, MAX_RETRY))
-
-    if to_download:
-        print(f"[perf] downloading missing PDFs: {len(to_download)} (threads={max_workers_download})")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_download) as ex:
-            futs = [ex.submit(_download_pdf_task, a) for a in to_download]
-            for fut in concurrent.futures.as_completed(futs):
-                ok, msg = fut.result()
-                if not ok:
-                    print(f"[download] failed: {msg}")
-        time.sleep(0.5)
+    # ------------------------------------------------------------------
+    # Phase 5: 下载缺失 PDF
+    # - 下载使用线程池
+    # - 这里只负责把文件落到本地，不做解析和入库
+    #
+    # 后续拆分建议：
+    # - download_missing_pdfs(candidates, session, ...)
+    # ------------------------------------------------------------------
+    download_missing_pdfs(
+        candidates,
+        session=session,
+        get_timeout=GET_TIMEOUT,
+        max_retry=MAX_RETRY,
+        max_workers_download=max_workers_download,
+    )
 
     # 主线程：页数过滤 + 数据库去重/是否需要重解析判定
-    parse_jobs: list[dict] = []
-    for c in candidates:
-        file_path = c["file_path"]
-        if not os.path.exists(file_path):
-            continue
-        # Safety: never parse B-shares
-        if str(c.get("stock_code") or "").startswith(("200", "201", "900")):
-            continue
-
-        # 页数判断（短 PDF 直接跳过）
-        try:
-            with pdfplumber.open(file_path) as pdf:
-                page_count = len(pdf.pages)
-        except Exception as e:
-            print(f"无法读取PDF页数，跳过: {c['title']} err={e}")
-            continue
-
-        if page_count < 50:
-            # 非完整年报（公告/更正等短PDF）
-            continue
-
-        c["page_count"] = page_count
-
-        existing_id = db.get_report_id(c["stock_code"], c["year"])
-        if existing_id is not None and db.is_mda_complete(existing_id):
-            if not reparse_existing:
-                continue
-
-        parse_jobs.append(c)
+    # ------------------------------------------------------------------
+    # Phase 6: 构建解析任务
+    # - 确认 PDF 已存在
+    # - 过滤 B 股和短 PDF
+    # - 基于 DB 现状判断是否需要重解析
+    #
+    # 这段实际上是在做“解析前调度决策”，适合将来拆到 pipeline/planner 层。
+    # ------------------------------------------------------------------
+    parse_jobs = build_parse_jobs(
+        candidates,
+        db=db,
+        reparse_existing=reparse_existing,
+    )
 
     print(f"[perf] parse_jobs={len(parse_jobs)} (backend={parse_backend}, workers={max_workers_parse})")
 
-    # 并行解析
-    parse_results: list[tuple[dict, dict[str, Any]]] = []
-    if parse_jobs:
-        Executor = concurrent.futures.ProcessPoolExecutor if parse_backend == "process" else concurrent.futures.ThreadPoolExecutor
-        with Executor(max_workers=max_workers_parse) as ex:
-            fut_map = {
-                ex.submit(_parse_pdf_task, (c["file_path"], c.get("page_count"), c.get("stock_code"), c.get("year"))): c
-                for c in parse_jobs
-            }
-            for fut in concurrent.futures.as_completed(fut_map):
-                c = fut_map[fut]
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    # worker crash: store a fallback in main thread
-                    parser_local = AnnualReportParser()
-                    fb = parser_local.build_fallback_mda(c["file_path"], reason=f"exception:{type(e).__name__}", page_count=int(c.get("page_count") or 0))
-                    res = {"ok": False, "mda": fb, "reason": f"exception:{type(e).__name__}", "page_count": c.get("page_count")}
-                parse_results.append((c, res))
+    # ------------------------------------------------------------------
+    # Phase 7: 并行解析 PDF
+    # - worker 内只做纯解析，不共享 DB 连接
+    # - 若 worker 异常，主线程构造 fallback placeholder
+    #
+    # 这里已经天然具备拆成 parser worker 层的条件。
+    # ------------------------------------------------------------------
+    parse_results = run_parse_jobs(
+        parse_jobs,
+        parse_backend=parse_backend,
+        max_workers_parse=max_workers_parse,
+        parse_fn=_parse_pdf_task,
+        fallback_on_worker_error=_build_worker_fallback_result,
+    )
 
     # 主线程写库（避免多进程共享 DB 连接）
     # 按披露时间从新到旧写入，便于你查看日志
     parse_results.sort(key=lambda x: (x[0].get("ts") or 0), reverse=True)
     written_report_ids: list[int] = []
+
+    # ------------------------------------------------------------------
+    # Phase 8: 落库与日志输出
+    # - annual_reports upsert
+    # - annual_report_mda upsert
+    # - 补充行业信息
+    #
+    # 未来可以把“数据组装”和“repository 调用”再分开一层，进一步瘦身 main()。
+    # ------------------------------------------------------------------
     for c, res in parse_results:
         col = c.get("col")
         stock_code = c["stock_code"]
@@ -3043,6 +1500,11 @@ def main():
 
     # 性能摘要：打印最慢的若干个 PDF 解析耗时
     if parse_results:
+        # --------------------------------------------------------------
+        # Phase 9: 解析性能摘要与单公司模式后处理
+        # - 打印最慢 PDF
+        # - 单公司模式下触发 report_scoring
+        # --------------------------------------------------------------
         perf_rows = []
         for c, res in parse_results:
             try:
@@ -3070,6 +1532,13 @@ def main():
                 print(f"[score] 公司历史年报打分失败: {e}")
                 raise
 
+    # ------------------------------------------------------------------
+    # Phase 10: 持久化增量状态
+    # - 只在 use_last_crawl 模式下推进状态
+    # - 始终写 real_end_date，不写 query_end_date
+    #
+    # 这一段可以在拆分后收敛到 state.py / pipeline.py 的收尾逻辑。
+    # ------------------------------------------------------------------
     # 写入本次抓取的截止时间（用于下次增量）；解析已并行化但截止时间仍以本次运行结束时刻为准
     if use_last_crawl:
         # 写入真实抓取截止时间（当前时间），不要写入 query_end_date（明天）以免影响下次增量窗口。

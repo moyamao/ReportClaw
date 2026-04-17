@@ -1546,6 +1546,20 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
         else:
             summary_rows = sort_rows_by_score_desc(rows)
 
+    def _row_nav_key(r: dict) -> str:
+        raw = "|".join(
+            [
+                str(r.get("report_id") or "").strip(),
+                str(r.get("stock_code") or "").strip(),
+                str(r.get("report_year") or "").strip(),
+                str(r.get("publish_date") or "").strip(),
+            ]
+        )
+        return re.sub(r"[^0-9A-Za-z]+", "_", raw).strip("_") or "row"
+
+    score_row_keys = {_row_nav_key(r) for r in score_rows}
+    summary_row_keys = {_row_nav_key(r) for r in summary_rows}
+
     # Cover page placeholder
     story.append(Spacer(1, 260 * mm))
     story.append(PageBreak())
@@ -1641,7 +1655,11 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
         if is_parse_failed:
             header += " | PARSE_FAILED"
 
-        story.append(Paragraph(header, stock_header))
+        nav_key = _row_nav_key(r)
+        score_anchor = f"score_{nav_key}"
+        summary_anchor = f"summary_{nav_key}"
+
+        story.append(Paragraph(f'<a name="{score_anchor}"/>{escape(header)}', stock_header))
         story.append(Paragraph(escape(format_industry_line(r)), industry_line))
         # 0) 好坏词分数（来自 annual_report_score_hits / DB）
         db_score = r.get("score_total")
@@ -1662,6 +1680,8 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
             score_badge = format_score_badge(score_info, max_items=4)
             if score_badge:
                 story.append(Paragraph(escape(score_badge), score_line))
+        if (not score_only) and nav_key in summary_row_keys:
+            story.append(Paragraph(f'<a href="#{summary_anchor}">跳到摘要部分</a>', score_line))
         detail_blocks = _build_score_detail_blocks(r, max_rows=10)
         if detail_blocks:
             story.extend(detail_blocks)
@@ -1708,8 +1728,14 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
         if is_parse_failed:
             header += " | PARSE_FAILED"
 
-        story.append(Paragraph(header, stock_header))
+        nav_key = _row_nav_key(r)
+        score_anchor = f"score_{nav_key}"
+        summary_anchor = f"summary_{nav_key}"
+
+        story.append(Paragraph(f'<a name="{summary_anchor}"/>{escape(header)}', stock_header))
         story.append(Paragraph(escape(format_industry_line(r)), industry_line))
+        if nav_key in score_row_keys:
+            story.append(Paragraph(f'<a href="#{score_anchor}">返回评分部分</a>', score_line))
 
         def add_divider():
             story.append(Spacer(1, 2 * mm))
@@ -1861,6 +1887,17 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
         else:
             summary_rows = sort_rows_by_score_desc(rows)
 
+    def _row_nav_key(r: dict) -> str:
+        raw = "|".join(
+            [
+                str(r.get("report_id") or "").strip(),
+                str(r.get("stock_code") or "").strip(),
+                str(r.get("report_year") or "").strip(),
+                str(r.get("publish_date") or "").strip(),
+            ]
+        )
+        return re.sub(r"[^0-9A-Za-z]+", "_", raw).strip("_") or "row"
+
     def make_header(r: dict) -> str:
         file_path = r.get("file_path", "") or ""
         pdf_name = ""
@@ -1895,6 +1932,14 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
     spine_items = []
     navpoints = []
     xhtml_files: dict[str, str] = {}
+    score_targets: dict[str, str] = {}
+    summary_targets: dict[str, str] = {}
+
+    if (not score_only) and summary_rows:
+        summary_start_idx = len(score_rows) + 1
+        for j, r in enumerate(summary_rows, start=1):
+            chap_idx = summary_start_idx + j
+            summary_targets[_row_nav_key(r)] = f"chap{chap_idx:03d}.xhtml#top"
 
     # Cover page (XHTML) - blue sky + title
     cover_xhtml = f"""<?xml version='1.0' encoding='utf-8'?>
@@ -1973,7 +2018,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
             parts.append(f"<h3>{_escape_xhtml(cur_score_year)}年</h3>")
             last_score_year = cur_score_year
         parts += [
-            f"<h2>{_escape_xhtml(header)}</h2>",
+            f"<h2 id=\"top\">{_escape_xhtml(header)}</h2>",
             f"<p class=\"noindent industry\">{_escape_xhtml(industry_line)}</p>",
             "<h3>好坏词分数</h3>",
         ]
@@ -1994,6 +2039,9 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
             badge = format_score_badge(score_info, max_items=4)
             if badge:
                 parts.append(f"<p class=\"noindent\"><strong>{_escape_xhtml(badge)}</strong></p>")
+        summary_href = summary_targets.get(_row_nav_key(r))
+        if summary_href:
+            parts.append(f"<p class=\"noindent\"><a href=\"{_escape_xhtml(summary_href)}\">跳到摘要部分</a></p>")
 
         score_details_html = _score_details_to_xhtml(r, max_rows=20)
         if score_details_html:
@@ -2035,6 +2083,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
 
         fn = f"OEBPS/chap{idx:03d}.xhtml"
         xhtml_files[fn] = xhtml
+        score_targets[_row_nav_key(r)] = f"chap{idx:03d}.xhtml#top"
 
         item_id = f"chap{idx:03d}"
         manifest_items.append((item_id, f"chap{idx:03d}.xhtml", "application/xhtml+xml"))
@@ -2108,9 +2157,12 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
             chairman = str(r.get("chairman_letter") or "").strip()
 
             company_parts = [
-                f"<h2>{_escape_xhtml(header)}</h2>",
+                f"<h2 id=\"top\">{_escape_xhtml(header)}</h2>",
                 f"<p class=\"noindent industry\">{_escape_xhtml(industry_line)}</p>",
             ]
+            score_href = score_targets.get(_row_nav_key(r))
+            if score_href:
+                company_parts.append(f"<p class=\"noindent\"><a href=\"{_escape_xhtml(score_href)}\">返回评分部分</a></p>")
             if chairman:
                 company_parts += [
                     "<h3>董事长致辞 / 致股东(投资者)信</h3>",
@@ -2155,6 +2207,7 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
 
             company_fn = f"OEBPS/chap{chap_idx:03d}.xhtml"
             xhtml_files[company_fn] = company_xhtml
+            summary_targets[_row_nav_key(r)] = f"chap{chap_idx:03d}.xhtml#top"
             company_item_id = f"chap{chap_idx:03d}"
             manifest_items.append((company_item_id, f"chap{chap_idx:03d}.xhtml", "application/xhtml+xml"))
             spine_items.append(company_item_id)
@@ -2252,12 +2305,6 @@ def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str
     if not host or not user or not password or not from_addr:
         raise RuntimeError("email config incomplete: need host/user/pass/from")
 
-    msg = EmailMessage()
-    msg["From"] = from_addr
-    msg["To"] = to_addr  # may be comma-separated
-    msg["Subject"] = subject
-    msg.set_content(body)
-
     ap = Path(attachment_path)
     data = ap.read_bytes()
     size_mb = len(data) / (1024 * 1024)
@@ -2289,28 +2336,42 @@ def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str
             f"建议：email.timeout=180~300，或减少日报内容/标的数量。"
         )
 
-    # Attach PDF (required)
-    msg.add_attachment(data, maintype="application", subtype="pdf", filename=ap.name)
+    recipients = [x.strip() for x in re.split(r"[;,]", to_addr) if x.strip()]
+    if not recipients:
+        raise RuntimeError("email recipients empty after parsing 'to'")
 
-    # Attach EPUB (optional)
+    epub_bytes: bytes | None = None
     if epub_p is not None:
         epub_bytes = epub_p.read_bytes()
-        # Use correct epub+zip mime; many clients rely on this
-        msg.add_attachment(
-            epub_bytes,
-            maintype="application",
-            subtype="epub+zip",
-            filename=epub_p.name,
-        )
+
+    def _build_message() -> EmailMessage:
+        msg = EmailMessage()
+        msg["From"] = from_addr
+        msg["To"] = ", ".join(recipients)
+        msg["Subject"] = subject
+        msg.set_content(body)
+        msg.add_attachment(data, maintype="application", subtype="pdf", filename=ap.name)
+        if epub_p is not None and epub_bytes is not None:
+            # Use correct epub+zip mime; many clients rely on this
+            msg.add_attachment(
+                epub_bytes,
+                maintype="application",
+                subtype="epub+zip",
+                filename=epub_p.name,
+            )
+        return msg
 
     last_err = None
 
     for attempt in range(1, retries + 2):
         try:
+            msg = _build_message()
             if use_ssl:
                 with smtplib.SMTP_SSL(host, port, timeout=timeout_sec) as s:
+                    s.ehlo()
                     s.login(user, password)
-                    s.send_message(msg)
+                    s.noop()
+                    s.sendmail(from_addr, recipients, msg.as_bytes())
             else:
                 with smtplib.SMTP(host, port, timeout=timeout_sec) as s:
                     s.ehlo()
@@ -2324,7 +2385,8 @@ def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str
                             f"若是新浪邮箱，通常请使用 465 + SSL（use_ssl=true）。"
                         )
                     s.login(user, password)
-                    s.send_message(msg)
+                    s.noop()
+                    s.sendmail(from_addr, recipients, msg.as_bytes())
 
             if attempt > 1:
                 print(f"[email] send succeeded on attempt {attempt}")
