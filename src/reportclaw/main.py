@@ -120,10 +120,18 @@ except Exception:
     jq_get_industry = None
     JQDATA_AVAILABLE = False
 
+try:
+    import tushare as ts
+    TUSHARE_AVAILABLE = True
+except Exception:
+    ts = None
+    TUSHARE_AVAILABLE = False
+
 # main.py 位于 src/reportclaw/ 下，所以项目根目录是再向上两级
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONF_DIR = PROJECT_ROOT / "conf"
 DATA_DIR = PROJECT_ROOT / "data"
+CACHE_DIR = DATA_DIR / "cache"
 DOWNLOADS_DIR = DATA_DIR / "downloads"
 DAILY_DIR = DATA_DIR / "report"
 STATE_DIR = DATA_DIR / "state"
@@ -458,6 +466,365 @@ class JoinQuantIndustryClient:
 
         self._cache[cache_key] = dict(result)
         return dict(result)
+
+
+class TushareIndustryClient:
+    """Tushare industry enrichment based on stock_basic.industry."""
+
+    def __init__(self):
+        cfg = configparser.ConfigParser()
+        cfg.read(CONF_DIR / "config.ini", encoding="utf-8")
+
+        self.enabled = False
+        self._cache = {}
+        self._logged_disabled_reason = False
+        self._pro = None
+        self._stock_basic_map = None
+        self._stock_basic_cache_path = CACHE_DIR / "tushare_stock_basic_industry.json"
+        self._stock_basic_refresh_attempted = False
+
+        if not TUSHARE_AVAILABLE:
+            self._log_disabled_once("[tushare] tushare 未安装，跳过行业同步")
+            return
+
+        enabled = cfg.getboolean("tushare", "enabled", fallback=False)
+        if not enabled:
+            self._log_disabled_once("[tushare] enabled=false，跳过行业同步")
+            return
+
+        token = cfg.get("tushare", "token", fallback="").strip()
+        if not token:
+            self._log_disabled_once("[tushare] 缺少 token，跳过行业同步")
+            return
+
+        try:
+            self._pro = ts.pro_api(token)
+            self.enabled = True
+            print("[tushare] auth ok")
+        except Exception as e:
+            self._log_disabled_once(f"[tushare] auth failed: {e}")
+
+    def _log_disabled_once(self, msg: str) -> None:
+        if not self._logged_disabled_reason:
+            print(msg)
+            self._logged_disabled_reason = True
+
+    def _load_stock_basic_map_from_disk(self) -> dict[str, str] | None:
+        path = self._stock_basic_cache_path
+        if not path.exists():
+            return None
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            data = obj.get("data") if isinstance(obj, dict) else None
+            if not isinstance(data, dict):
+                return None
+            out = {}
+            for k, v in data.items():
+                key = str(k).strip()
+                val = str(v).strip()
+                if key and val:
+                    out[key] = val
+            if out:
+                updated_at = str(obj.get("updated_at") or "").strip() if isinstance(obj, dict) else ""
+                if updated_at:
+                    print(f"[tushare] stock_basic map loaded from disk: {len(out)} updated_at={updated_at}")
+                else:
+                    print(f"[tushare] stock_basic map loaded from disk: {len(out)}")
+                return out
+        except Exception as e:
+            print(f"[tushare] stock_basic disk cache read failed: err={e}")
+        return None
+
+    def _save_stock_basic_map_to_disk(self, stock_basic_map: dict[str, str]) -> None:
+        if not stock_basic_map:
+            return
+        path = self._stock_basic_cache_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source": "tushare.stock_basic",
+                "count": len(stock_basic_map),
+                "data": stock_basic_map,
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[tushare] stock_basic map saved to disk: {len(stock_basic_map)} path={path}")
+        except Exception as e:
+            print(f"[tushare] stock_basic disk cache write failed: err={e}")
+
+    def _ensure_stock_basic_map(self) -> dict[str, str]:
+        if self._stock_basic_map is not None:
+            return self._stock_basic_map
+
+        # Desired strategy:
+        # 1) try refreshing from Tushare once per run
+        # 2) if refresh fails, fall back to local disk cache
+        if not self._stock_basic_refresh_attempted:
+            self._stock_basic_refresh_attempted = True
+            try:
+                df = self._pro.stock_basic(
+                    exchange="",
+                    list_status="L",
+                    fields="ts_code,symbol,name,industry",
+                )
+                stock_basic_map = {}
+                if df is not None and not getattr(df, "empty", True):
+                    for _, row in df.iterrows():
+                        symbol = str(row.get("symbol") or "").strip()
+                        industry_name = str(row.get("industry") or "").strip()
+                        if symbol and industry_name:
+                            stock_basic_map[symbol] = industry_name
+                self._stock_basic_map = stock_basic_map
+                print(f"[tushare] stock_basic map loaded: {len(self._stock_basic_map)}")
+                self._save_stock_basic_map_to_disk(self._stock_basic_map)
+                return self._stock_basic_map
+            except Exception as e:
+                print(f"[tushare] stock_basic preload failed: err={e}")
+
+        disk_map = self._load_stock_basic_map_from_disk()
+        if disk_map:
+            self._stock_basic_map = disk_map
+            return self._stock_basic_map
+
+        self._stock_basic_map = {}
+        return self._stock_basic_map
+
+    @staticmethod
+    def normalize_stock_code(stock_code: str) -> str:
+        code = str(stock_code).strip()
+        if code.startswith(("600", "601", "603", "605", "688", "689", "900")):
+            return f"{code}.SH"
+        if code.startswith(("8", "4", "9")):
+            return f"{code}.BJ"
+        return f"{code}.SZ"
+
+    def get_sw_industry(self, stock_code: str, date: str | None = None) -> dict:
+        requested_date = str(date or "").strip()[:10] or None
+        base = {
+            "sw_l1_code": None,
+            "sw_l1_name": None,
+            "sw_l2_code": None,
+            "sw_l2_name": None,
+            "sw_l3_code": None,
+            "sw_l3_name": None,
+            "industry_source": "tushare",
+            "industry_lookup_date": requested_date,
+        }
+
+        if not self.enabled or self._pro is None:
+            return dict(base)
+
+        cache_key = str(stock_code).strip()
+        if cache_key in self._cache:
+            return dict(self._cache[cache_key])
+
+        stock_basic_map = self._ensure_stock_basic_map()
+        industry_name = str((stock_basic_map or {}).get(cache_key) or "").strip()
+        if not industry_name:
+            self._cache[cache_key] = dict(base)
+            return dict(base)
+
+        result = dict(base)
+        if industry_name:
+            # Tushare stock_basic.industry is not a Shenwan hierarchy, but we map it
+            # into sw_l1_name so downstream storage/reporting can keep one display field.
+            result["sw_l1_name"] = industry_name
+        self._cache[cache_key] = dict(result)
+        return dict(result)
+
+
+class LocalAnnualReportsIndustryClient:
+    """Reuse previously stored industry info from annual_reports as a local cache."""
+
+    def __init__(self):
+        cfg = configparser.ConfigParser()
+        cfg.read(CONF_DIR / "config.ini", encoding="utf-8")
+
+        self.enabled = True
+        self._cache = {}
+        self._logged_disabled_reason = False
+        self._conn = None
+
+        try:
+            self._conn = mysql.connector.connect(
+                host=cfg.get("mysql", "host"),
+                port=cfg.getint("mysql", "port", fallback=3306),
+                user=cfg.get("mysql", "user"),
+                password=cfg.get("mysql", "pass"),
+                database=cfg.get("mysql", "db"),
+                charset="utf8mb4",
+            )
+            print("[industry] local annual_reports cache ready")
+        except Exception as e:
+            self.enabled = False
+            self._log_disabled_once(f"[industry] local annual_reports cache unavailable: {e}")
+
+    def _log_disabled_once(self, msg: str) -> None:
+        if not self._logged_disabled_reason:
+            print(msg)
+            self._logged_disabled_reason = True
+
+    @staticmethod
+    def _has_full_sw_levels(row: dict | None, *, use_stock_master_names: bool = False) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if use_stock_master_names:
+            return all(
+                str(row.get(k) or "").strip()
+                for k in ("sw_l1_code", "sw_l1", "sw_l2_code", "sw_l2", "sw_l3_code", "sw_l3")
+            )
+        return all(
+            str(row.get(k) or "").strip()
+            for k in ("sw_l1_code", "sw_l1_name", "sw_l2_code", "sw_l2_name", "sw_l3_code", "sw_l3_name")
+        )
+
+    def get_sw_industry(self, stock_code: str, date: str | None = None) -> dict:
+        requested_date = str(date or "").strip()[:10] or None
+        base = {
+            "sw_l1_code": None,
+            "sw_l1_name": None,
+            "sw_l2_code": None,
+            "sw_l2_name": None,
+            "sw_l3_code": None,
+            "sw_l3_name": None,
+            "industry_source": "local_annual_reports",
+            "industry_lookup_date": requested_date,
+        }
+        if not self.enabled or self._conn is None:
+            return dict(base)
+
+        code = str(stock_code).strip()
+        if not code:
+            return dict(base)
+        if code in self._cache:
+            return dict(self._cache[code])
+
+        stock_master_sql = """
+            SELECT
+              sw_l1_code, sw_l1,
+              sw_l2_code, sw_l2,
+              sw_l3_code, sw_l3,
+              industry_source, industry_lookup_date
+            FROM stock_master_cn
+            WHERE stock_code=%s
+            LIMIT 1
+        """
+        sql = """
+            SELECT
+              sw_l1_code, sw_l1_name,
+              sw_l2_code, sw_l2_name,
+              sw_l3_code, sw_l3_name,
+              industry_source, industry_lookup_date
+            FROM annual_reports
+            WHERE stock_code=%s
+              AND COALESCE(sw_l1_code, '') <> ''
+              AND COALESCE(sw_l1_name, '') <> ''
+              AND COALESCE(sw_l2_code, '') <> ''
+              AND COALESCE(sw_l2_name, '') <> ''
+              AND COALESCE(sw_l3_code, '') <> ''
+              AND COALESCE(sw_l3_name, '') <> ''
+            ORDER BY
+              CASE WHEN publish_date IS NULL THEN 1 ELSE 0 END,
+              publish_date DESC,
+              id DESC
+            LIMIT 1
+        """
+        try:
+            cur = self._conn.cursor(dictionary=True)
+            cur.execute(stock_master_sql, (code,))
+            row = cur.fetchone()
+            if self._has_full_sw_levels(row, use_stock_master_names=True):
+                result = dict(base)
+                result["sw_l1_code"] = row.get("sw_l1_code")
+                result["sw_l1_name"] = row.get("sw_l1")
+                result["sw_l2_code"] = row.get("sw_l2_code")
+                result["sw_l2_name"] = row.get("sw_l2")
+                result["sw_l3_code"] = row.get("sw_l3_code")
+                result["sw_l3_name"] = row.get("sw_l3")
+                result["industry_source"] = str(row.get("industry_source") or "").strip() or "stock_master_cn"
+                lookup_date = row.get("industry_lookup_date")
+                if lookup_date:
+                    result["industry_lookup_date"] = str(lookup_date)[:10]
+                self._cache[code] = dict(result)
+                cur.close()
+                return dict(result)
+
+            cur.execute(sql, (code,))
+            row = cur.fetchone()
+            cur.close()
+        except Exception as e:
+            print(f"[industry] local annual_reports lookup failed: stock={code} err={e}")
+            self._cache[code] = dict(base)
+            return dict(base)
+
+        if not self._has_full_sw_levels(row):
+            self._cache[code] = dict(base)
+            return dict(base)
+
+        result = dict(base)
+        for key in ("sw_l1_code", "sw_l1_name", "sw_l2_code", "sw_l2_name", "sw_l3_code", "sw_l3_name"):
+            val = row.get(key)
+            if val not in (None, ""):
+                result[key] = val
+        source = str(row.get("industry_source") or "").strip()
+        if source:
+            result["industry_source"] = source
+        lookup_date = row.get("industry_lookup_date")
+        if lookup_date:
+            result["industry_lookup_date"] = str(lookup_date)[:10]
+        self._cache[code] = dict(result)
+        return dict(result)
+
+
+class CompositeIndustryClient:
+    def __init__(self, clients: list[Any]):
+        self.clients = [c for c in clients if c is not None]
+
+    def get_sw_industry(self, stock_code: str, date: str | None = None) -> dict:
+        last = {
+            "sw_l1_code": None,
+            "sw_l1_name": None,
+            "sw_l2_code": None,
+            "sw_l2_name": None,
+            "sw_l3_code": None,
+            "sw_l3_name": None,
+            "industry_source": None,
+            "industry_lookup_date": str(date or "").strip()[:10] or None,
+        }
+        for client in self.clients:
+            try:
+                result = client.get_sw_industry(stock_code, date)
+            except Exception as e:
+                print(f"[industry] provider failed: {type(client).__name__} stock={stock_code} err={e}")
+                continue
+            if isinstance(result, dict):
+                last = result
+                if any(result.get(k) for k in ("sw_l1_name", "sw_l2_name", "sw_l3_name")):
+                    return result
+        return dict(last)
+
+
+def build_industry_client() -> Any:
+    cfg = configparser.ConfigParser()
+    cfg.read(CONF_DIR / "config.ini", encoding="utf-8")
+    provider = cfg.get("industry", "provider", fallback="auto").strip().lower()
+
+    local_client = LocalAnnualReportsIndustryClient()
+    jq_client = JoinQuantIndustryClient()
+    ts_client = TushareIndustryClient()
+
+    if provider == "local":
+        print("[industry] provider=local")
+        return local_client
+    if provider == "jqdata":
+        print("[industry] provider=jqdata")
+        return jq_client
+    if provider == "tushare":
+        print("[industry] provider=tushare")
+        return ts_client
+
+    print("[industry] provider=auto (local -> jqdata -> tushare)")
+    return CompositeIndustryClient([local_client, jq_client, ts_client])
 
 # ===============================
 # PDF解析器
@@ -1300,7 +1667,7 @@ def main():
     # ------------------------------------------------------------------
     db = MySQLClient(conf_dir=CONF_DIR)
     parser = AnnualReportParser()
-    industry_client = JoinQuantIndustryClient()
+    industry_client = build_industry_client()
 
     # ------------------------------------------------------------------
     # Phase 1: 读取配置并解析运行模式
@@ -1490,6 +1857,7 @@ def main():
             c["file_path"],
             industry_info=industry_info,
         )
+        db.upsert_stock_master_industry(stock_code, c["stock_name"], industry_info)
         db.insert_mda(report_id, res.get("mda") or {})
         written_report_ids.append(int(report_id))
 

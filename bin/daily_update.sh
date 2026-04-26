@@ -127,8 +127,7 @@ fi
 log "report_scoring.py 执行完成"
 
 # 3) 跑 daily_report.py
-#    - 不加 --no-email，因为我们就是要发邮件
-#    - 通过命令行临时覆盖 [email] enabled=true，不污染 config.ini
+#    - 是否发邮件由 conf/config.ini 的 [email].enabled 控制
 #    - 使用模块方式启动，避免 reportclaw 包导入失败
 #    - daily_report.py 自己会判断是否有新增记录；如果没有，会输出提示并直接结束
 #    - 更新 Google Sheet 等外网访问走本机代理
@@ -136,8 +135,8 @@ export HTTPS_PROXY=http://127.0.0.1:1092
 export HTTP_PROXY=http://127.0.0.1:1092
 export https_proxy=http://127.0.0.1:1092
 export http_proxy=http://127.0.0.1:1092
-log "开始运行 daily_report.py（临时覆盖 [email] enabled=true）"
-if ! PYTHONPATH="$PROJECT_ROOT/src" "$VENV_PY" -m reportclaw.daily_report --config "$CONFIG_PATH" --email-enabled true >> "$LOG_FILE" 2>&1; then
+log "开始运行 daily_report.py（邮件开关按 config.ini 执行）"
+if ! PYTHONPATH="$PROJECT_ROOT/src" "$VENV_PY" -m reportclaw.daily_report --config "$CONFIG_PATH" >> "$LOG_FILE" 2>&1; then
   log "daily_report.py 执行失败，任务终止"
   exit 1
 fi

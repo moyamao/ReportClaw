@@ -489,6 +489,59 @@ def load_target_stocks_from_annual_reports(conn) -> List[StockBasic]:
     return out
 
 
+def load_stock_master_rows_from_annual_reports(conn) -> List[Tuple[str, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], str]]:
+    """Build stock_master_cn rows from the latest industry info already stored in annual_reports.
+
+    Priority:
+    - one latest row per stock_code by publish_date desc, id desc
+    - reuse existing annual_reports sw_l1_name/sw_l1_code
+    - industry defaults to sw_l1_name for compatibility with main flow
+    """
+    sql = """
+    SELECT
+      t.stock_code,
+      t.stock_name,
+      t.sw_l1_name,
+      t.sw_l1_code
+    FROM annual_reports t
+    JOIN (
+      SELECT stock_code, MAX(id) AS max_id
+      FROM annual_reports
+      WHERE stock_code IS NOT NULL
+        AND stock_code <> ''
+        AND (
+          COALESCE(sw_l1_code, '') <> '' OR
+          COALESCE(sw_l1_name, '') <> ''
+        )
+      GROUP BY stock_code
+    ) latest
+      ON latest.max_id = t.id
+    """
+    rows: List[Tuple[str, str, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], str]] = []
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        for r in cur.fetchall():
+            code = str(r.get("stock_code") or "").strip()
+            name = str(r.get("stock_name") or "").strip()
+            sw_l1 = str(r.get("sw_l1_name") or "").strip() or None
+            sw_l1_code = str(r.get("sw_l1_code") or "").strip() or None
+            if not code:
+                continue
+            rows.append(
+                (
+                    code,
+                    name,
+                    sw_l1,       # industry
+                    sw_l1,
+                    sw_l1_code,
+                    None,        # citic_l1
+                    None,        # citic_l1_code
+                    _guess_exchange_from_code(code),
+                )
+            )
+    return rows
+
+
 # -----------------------------
 # Upsert
 # -----------------------------
@@ -593,6 +646,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None, help="config.ini path (default: conf/config.ini)")
     ap.add_argument("--no-sw", action="store_true", help="skip SW industry mapping")
+    ap.add_argument("--from-annual-reports", action="store_true", help="fill stock_master_cn directly from latest industry fields already stored in annual_reports")
     ap.add_argument("--limit", type=int, default=0, help="debug limit N stocks")
     ap.add_argument("--dry-run", action="store_true", help="do not write MySQL")
     ap.add_argument("--sleep", type=float, default=0.25, help="sleep seconds between SW index calls")
@@ -606,6 +660,22 @@ def main() -> None:
 
     conn = mysql_connect(cfg)
     ensure_schema(conn)
+
+    if args.from_annual_reports:
+        rows = load_stock_master_rows_from_annual_reports(conn)
+        if args.limit and args.limit > 0:
+            rows = rows[: args.limit]
+        print(f"[db] annual_reports -> stock_master_cn rows={len(rows)}")
+        if args.dry_run:
+            print("[dry-run] skip db write")
+            return
+        if rows:
+            print("[db] upserting stock_master_cn from annual_reports ...")
+            upsert_stock_master_cn(conn, rows)
+            print("[db] done")
+        else:
+            print("[db] no rows with industry info found in annual_reports")
+        return
 
     print("[ak] building target stock universe ...")
     if args.full_market:

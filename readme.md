@@ -7,8 +7,13 @@
 - `reportclaw.main`
 - `reportclaw.report_scoring`
 - `reportclaw.daily_report`
+- `reportclaw.sync_industry_info`
 
 `reportBot.py` 目前仍是实验性解析方案，不属于当前生产主流程。
+
+行业独立同步说明见：
+
+- [docs/industry_sync.md](/Users/mhy/python/ReportClaw/docs/industry_sync.md)
 
 ## 环境准备
 
@@ -129,6 +134,13 @@ PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report --date 2026-02-28 --
 ```bash
 cd /Users/mhy/python/ReportClaw
 PYTHONPATH=src ./venv/bin/python -m reportclaw.daily_report --stock-code 300750 --no-email
+```
+
+只刷新行业信息，不做财报抓取和解析：
+
+```bash
+cd /Users/mhy/python/ReportClaw
+PYTHONPATH=src ./venv/bin/python -m reportclaw.sync_industry_info
 ```
 
 ## 增量状态文件

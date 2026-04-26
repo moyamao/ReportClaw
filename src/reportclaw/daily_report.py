@@ -104,6 +104,8 @@ from pathlib import Path
 
 from reportclaw.sheet_sync import sync_rows_to_google_sheet
 
+_SCORE_HIT_CONTEXT_EXPR_CACHE: dict[str, str] = {}
+
 
 def sync_rows_to_google_sheet_with_retry(cfg, rows, run_date, max_attempts: int = 5, base_sleep: float = 3.0):
     """Retry Google Sheets sync on transient quota/rate-limit errors.
@@ -560,6 +562,10 @@ def _detect_score_hit_context_expr(conn) -> str:
         if not db_name:
             return "''"
 
+        cached = _SCORE_HIT_CONTEXT_EXPR_CACHE.get(str(db_name))
+        if cached is not None:
+            return cached
+
         cur = conn.cursor()
         cur.execute(
             """
@@ -574,11 +580,14 @@ def _detect_score_hit_context_expr(conn) -> str:
 
         present = [c for c in prefer if c in cols]
         if not present:
+            _SCORE_HIT_CONTEXT_EXPR_CACHE[str(db_name)] = "''"
             return "''"
 
         # Build COALESCE(h.`c1`, h.`c2`, ..., '')
         parts = [f"h.`{c}`" for c in present]
-        return f"COALESCE({', '.join(parts)}, '')"
+        expr = f"COALESCE({', '.join(parts)}, '')"
+        _SCORE_HIT_CONTEXT_EXPR_CACHE[str(db_name)] = expr
+        return expr
 
     except Exception:
         return "''"
@@ -596,6 +605,88 @@ def _ensure_group_concat_max_len(conn, size: int = 1024 * 1024) -> None:
         cur.close()
     except Exception:
         pass
+
+
+def _timer_start() -> float:
+    return time.perf_counter()
+
+
+def _log_stage_elapsed(stage: str, started_at: float) -> float:
+    elapsed = time.perf_counter() - started_at
+    print(f"[perf] {stage}: {elapsed:.2f}s")
+    return elapsed
+
+
+def _build_score_hits_agg_join_sql(ctx_expr: str) -> str:
+    """Return a reusable aggregated score-hit subquery join.
+
+    This replaces three correlated subqueries per report row with one grouped scan
+    over annual_report_score_hits, which is materially faster when the日报 company
+    count grows.
+    """
+    return f"""
+        LEFT JOIN (
+          SELECT
+            h.report_id,
+            COALESCE(SUM(h.weight * h.hit_count), 0) AS score_total,
+            GROUP_CONCAT(
+              CONCAT(h.keyword, '(', h.hit_count, ')')
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '；'
+            ) AS score_hits,
+            GROUP_CONCAT(
+              CONCAT(
+                h.keyword, '|', h.weight, '|', h.hit_count, '|',
+                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
+              )
+              ORDER BY ABS(h.weight * h.hit_count) DESC
+              SEPARATOR '\n'
+            ) AS score_hit_details
+          FROM annual_report_score_hits h
+          GROUP BY h.report_id
+        ) score_agg ON score_agg.report_id = r.id
+    """
+
+
+def _fetch_report_rows(
+    conn,
+    *,
+    where_sql: str,
+    params: tuple,
+    order_by_sql: str,
+    include_created_at: bool = False,
+):
+    _ensure_group_concat_max_len(conn)
+    cur = conn.cursor(dictionary=True)
+    ctx_expr = _detect_score_hit_context_expr(conn)
+    created_at_sql = ",\n          m.created_at" if include_created_at else ""
+    score_join_sql = _build_score_hits_agg_join_sql(ctx_expr)
+    try:
+        cur.execute(
+            f"""
+            SELECT
+              r.id AS report_id,
+              r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
+              r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
+              r.sw_l1_name AS sw_industry1,
+              r.sw_l2_name AS sw_industry2,
+              r.sw_l3_name AS sw_industry3,
+              m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda{created_at_sql},
+              COALESCE(score_agg.score_total, 0) AS score_total,
+              score_agg.score_hits AS score_hits,
+              score_agg.score_hit_details AS score_hit_details
+            FROM annual_reports r
+            JOIN annual_report_mda m ON m.report_id = r.id
+            {score_join_sql}
+            WHERE {where_sql}
+            ORDER BY {order_by_sql}
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+        return rows or []
+    finally:
+        cur.close()
 
 
 def _parse_score_hit_detail_rows(r: dict, max_rows: int = 10, dedup: bool = True) -> list[dict]:
@@ -661,54 +752,12 @@ def _parse_score_hit_detail_rows(r: dict, max_rows: int = 10, dedup: bool = True
     return items
 
 def fetch_rows_by_publish_date(conn, publish_date: str):
-    _ensure_group_concat_max_len(conn)
-    cur = conn.cursor(dictionary=True)
-    ctx_expr = _detect_score_hit_context_expr(conn)
-    cur.execute(
-        f"""
-        SELECT
-          r.id AS report_id,
-          r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
-          r.sw_l1_name AS sw_industry1,
-          r.sw_l2_name AS sw_industry2,
-          r.sw_l3_name AS sw_industry3,
-          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
-          (
-            SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_total,
-          (
-            SELECT GROUP_CONCAT(
-              CONCAT(h.keyword, '(', h.hit_count, ')')
-              ORDER BY ABS(h.weight * h.hit_count) DESC
-              SEPARATOR '；'
-            )
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_hits
-          ,(
-            SELECT GROUP_CONCAT(
-              CONCAT(
-                h.keyword, '|', h.weight, '|', h.hit_count, '|',
-                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
-              )
-              ORDER BY ABS(h.weight * h.hit_count) DESC
-              SEPARATOR '\n'
-            )
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_hit_details
-        FROM annual_reports r
-        JOIN annual_report_mda m ON m.report_id = r.id
-        WHERE r.publish_date = %s
-        ORDER BY r.stock_code ASC
-        """,
-        (publish_date,),
+    return _fetch_report_rows(
+        conn,
+        where_sql="r.publish_date = %s",
+        params=(publish_date,),
+        order_by_sql="r.stock_code ASC",
     )
-    rows = cur.fetchall()
-    return rows or []
 
 
 # --- Fetch by publish_date range ---
@@ -716,54 +765,12 @@ def fetch_rows_by_publish_date_range(conn, start_date: str, end_date: str):
     """
     Fetch rows where publish_date between [start_date, end_date] inclusive. Dates are YYYY-MM-DD.
     """
-    _ensure_group_concat_max_len(conn)
-    cur = conn.cursor(dictionary=True)
-    ctx_expr = _detect_score_hit_context_expr(conn)
-    cur.execute(
-        f"""
-        SELECT
-          r.id AS report_id,
-          r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
-          r.sw_l1_name AS sw_industry1,
-          r.sw_l2_name AS sw_industry2,
-          r.sw_l3_name AS sw_industry3,
-          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
-          (
-            SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_total,
-          (
-            SELECT GROUP_CONCAT(
-              CONCAT(h.keyword, '(', h.hit_count, ')')
-              ORDER BY ABS(h.weight * h.hit_count) DESC
-              SEPARATOR '；'
-            )
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_hits
-          ,(
-            SELECT GROUP_CONCAT(
-              CONCAT(
-                h.keyword, '|', h.weight, '|', h.hit_count, '|',
-                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
-              )
-              ORDER BY ABS(h.weight * h.hit_count) DESC
-              SEPARATOR '\n'
-            )
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_hit_details
-        FROM annual_reports r
-        JOIN annual_report_mda m ON m.report_id = r.id
-        WHERE r.publish_date >= %s AND r.publish_date <= %s
-        ORDER BY r.publish_date DESC, r.stock_code ASC
-        """,
-        (start_date, end_date),
+    return _fetch_report_rows(
+        conn,
+        where_sql="r.publish_date >= %s AND r.publish_date <= %s",
+        params=(start_date, end_date),
+        order_by_sql="r.publish_date DESC, r.stock_code ASC",
     )
-    rows = cur.fetchall()
-    return rows or []
 
 
 def fetch_rows_by_stock_code(conn, stock_code: str):
@@ -771,110 +778,25 @@ def fetch_rows_by_stock_code(conn, stock_code: str):
 
     Ordered by report_year DESC, then publish_date DESC.
     """
-    _ensure_group_concat_max_len(conn)
-    cur = conn.cursor(dictionary=True)
-    ctx_expr = _detect_score_hit_context_expr(conn)
-    cur.execute(
-        f"""
-        SELECT
-          r.id AS report_id,
-          r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
-          r.sw_l1_name AS sw_industry1,
-          r.sw_l2_name AS sw_industry2,
-          r.sw_l3_name AS sw_industry3,
-          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
-          m.created_at,
-          (
-            SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_total,
-          (
-            SELECT GROUP_CONCAT(
-              CONCAT(h.keyword, '(', h.hit_count, ')')
-              ORDER BY ABS(h.weight * h.hit_count) DESC
-              SEPARATOR '；'
-            )
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_hits,
-          (
-            SELECT GROUP_CONCAT(
-              CONCAT(
-                h.keyword, '|', h.weight, '|', h.hit_count, '|',
-                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
-              )
-              ORDER BY ABS(h.weight * h.hit_count) DESC
-              SEPARATOR '\n'
-            )
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_hit_details
-        FROM annual_reports r
-        JOIN annual_report_mda m ON m.report_id = r.id
-        WHERE r.stock_code = %s
-        ORDER BY r.report_year DESC, r.publish_date DESC, r.stock_code ASC
-        """,
-        (stock_code,),
+    return _fetch_report_rows(
+        conn,
+        where_sql="r.stock_code = %s",
+        params=(stock_code,),
+        order_by_sql="r.report_year DESC, r.publish_date DESC, r.stock_code ASC",
+        include_created_at=True,
     )
-    rows = cur.fetchall()
-    cur.close()
-    return rows or []
 
 def fetch_rows_by_created_at_range(conn, start_ts: str, end_ts: str):
     """
     Fetch rows where annual_report_mda.created_at is in (start_ts, end_ts] (timestamps as strings 'YYYY-MM-DD HH:MM:SS').
     """
-    _ensure_group_concat_max_len(conn)
-    cur = conn.cursor(dictionary=True)
-    ctx_expr = _detect_score_hit_context_expr(conn)
-    cur.execute(
-        f"""
-        SELECT
-          r.id AS report_id,
-          r.stock_code, r.stock_name, r.report_year, r.publish_date, r.file_path,
-          r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
-          r.sw_l1_name AS sw_industry1,
-          r.sw_l2_name AS sw_industry2,
-          r.sw_l3_name AS sw_industry3,
-          m.industry_section, m.main_business_section, m.future_section, m.chairman_letter, m.full_mda,
-          m.created_at,
-          (
-            SELECT COALESCE(SUM(h.weight * h.hit_count), 0)
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_total,
-          (
-            SELECT GROUP_CONCAT(
-              CONCAT(h.keyword, '(', h.hit_count, ')')
-              ORDER BY ABS(h.weight * h.hit_count) DESC
-              SEPARATOR '；'
-            )
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_hits
-          ,(
-            SELECT GROUP_CONCAT(
-              CONCAT(
-                h.keyword, '|', h.weight, '|', h.hit_count, '|',
-                REPLACE(REPLACE({ctx_expr}, '\\r', ' '), '\\n', ' ')
-              )
-              ORDER BY ABS(h.weight * h.hit_count) DESC
-              SEPARATOR '\n'
-            )
-            FROM annual_report_score_hits h
-            WHERE h.report_id = r.id
-          ) AS score_hit_details
-        FROM annual_reports r
-        JOIN annual_report_mda m ON m.report_id = r.id
-        WHERE m.created_at > %s AND m.created_at <= %s
-        ORDER BY m.created_at DESC, r.stock_code ASC
-        """,
-        (start_ts, end_ts),
+    return _fetch_report_rows(
+        conn,
+        where_sql="m.created_at > %s AND m.created_at <= %s",
+        params=(start_ts, end_ts),
+        order_by_sql="m.created_at DESC, r.stock_code ASC",
+        include_created_at=True,
     )
-    rows = cur.fetchall()
-    return rows or []
 
 
 # --- Helper: sort rows by score DESC, then publish_date DESC, then stock_code ASC ---
@@ -971,7 +893,8 @@ def sort_rows_by_time_desc(rows: list[dict]) -> list[dict]:
 def sort_rows_by_report_year_desc(rows: list[dict]) -> list[dict]:
     """Sort rows for single-stock multi-year reports.
 
-    Order: report_year DESC, publish_date DESC, stock_code ASC.
+    Primary order: report_year DESC only.
+    We keep stable tie-breakers only for deterministic rendering when duplicated rows exist.
     """
     rows = list(rows or [])
 
@@ -988,6 +911,7 @@ def sort_rows_by_report_year_desc(rows: list[dict]) -> list[dict]:
         key=lambda r: (
             _year(r.get("report_year")),
             _date(r.get("publish_date")),
+            int(r.get("report_id") or 0),
             str(r.get("stock_code", "")),
         ),
         reverse=True,
@@ -1148,6 +1072,33 @@ def filter_rows_to_globally_latest_reports(conn, rows: list[dict]) -> list[dict]
         rid = int(r.get("report_id") or 0)
         if code and rid and latest_id_by_code.get(code) == rid:
             out.append(r)
+    return out
+
+
+def filter_rows_to_publish_year(rows: list[dict], year: int) -> list[dict]:
+    """Keep only rows whose publish_date falls in the given calendar year.
+
+    This is used by the normal daily task so historical reports backfilled by
+    one_stock mode do not leak into the current year's daily summary.
+    """
+    rows = list(rows or [])
+    out: list[dict] = []
+    dropped = 0
+
+    for r in rows:
+        raw = r.get("publish_date")
+        s = str(raw).strip() if raw is not None else ""
+        keep = False
+        if len(s) >= 4 and s[:4].isdigit():
+            keep = int(s[:4]) == int(year)
+
+        if keep:
+            out.append(r)
+        else:
+            dropped += 1
+
+    if dropped:
+        print(f"[daily_report] filtered historical rows by publish_year={year}: dropped={dropped}, kept={len(out)}")
     return out
 
 # Helper: whether a row should be visible in the score section
@@ -1568,7 +1519,8 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
     story.append(Paragraph(f"年报摘录汇总（{title_date}）", h1))
     story.append(Spacer(1, 4 * mm))
     if score_rows:
-        story.append(Paragraph("好坏词分数汇总（按分数从高到低）", section_header))
+        score_title = "好坏词分数汇总（按年份从近到远）" if single_stock_mode else "好坏词分数汇总（按分数从高到低）"
+        story.append(Paragraph(score_title, section_header))
         story.append(Spacer(1, 2 * mm))
     def pick_section_text(primary: str | None, fallback_full: str, max_chars: int = 12000) -> str | None:
         """Prefer primary section text; otherwise fall back to full_mda.
@@ -1700,11 +1652,21 @@ def generate_daily_summary_pdf(rows, out_path: str, title_date: str, summary_sor
 
     if score_rows:
         story.append(PageBreak())
-    summary_title = "摘要部分（按时间从新到旧）" if summary_sort == "time" else "摘要部分（按分数从高到低）"
+    if single_stock_mode:
+        summary_title = "摘要部分（按年份从近到远）"
+    else:
+        summary_title = "摘要部分（按时间从新到旧）" if summary_sort == "time" else "摘要部分（按分数从高到低）"
     story.append(Paragraph(summary_title, h1))
     story.append(Spacer(1, 6 * mm))
 
+    last_summary_year = None
     for i, r in enumerate(summary_rows):
+        if single_stock_mode:
+            cur_summary_year = _group_year_label(r.get("report_year"))
+            if cur_summary_year != last_summary_year:
+                story.append(Paragraph(f"{cur_summary_year}年", section_header))
+                story.append(Spacer(1, 2 * mm))
+                last_summary_year = cur_summary_year
         file_path = r.get("file_path", "") or ""
         pdf_name = ""
         try:
@@ -1935,12 +1897,6 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
     score_targets: dict[str, str] = {}
     summary_targets: dict[str, str] = {}
 
-    if (not score_only) and summary_rows:
-        summary_start_idx = len(score_rows) + 1
-        for j, r in enumerate(summary_rows, start=1):
-            chap_idx = summary_start_idx + j
-            summary_targets[_row_nav_key(r)] = f"chap{chap_idx:03d}.xhtml#top"
-
     # Cover page (XHTML) - blue sky + title
     cover_xhtml = f"""<?xml version='1.0' encoding='utf-8'?>
 <!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.1//EN'
@@ -1993,6 +1949,17 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
     play_order_base = 1
     # Load scoring rules once for all rows
     good_rules, bad_rules = _load_scoring_rules(configparser.ConfigParser())
+
+    if (not score_only) and summary_rows:
+        summary_start_idx = len(score_rows) + 1
+        for j, r in enumerate(summary_rows, start=1):
+            chap_idx = summary_start_idx + j
+            summary_targets[_row_nav_key(r)] = f"chap{chap_idx:03d}.xhtml#top"
+
+    if single_stock_mode:
+        summary_title = "摘要部分（按年份从近到远）"
+    else:
+        summary_title = "摘要部分（按时间从新到旧）" if summary_sort == "time" else "摘要部分（按分数从高到低）"
 
     last_score_year = None
     for idx, r in enumerate(score_rows, start=1):
@@ -2096,9 +2063,6 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
   <content src=\"chap{idx:03d}.xhtml\"/>
 </navPoint>"""
         )
-
-    summary_start_idx = len(score_rows) + 1
-    summary_title = "摘要部分（按时间从新到旧）" if summary_sort == "time" else "摘要部分（按分数从高到低）"
 
     if (not score_only) and summary_rows:
         # Overview chapter for summary section
@@ -2279,12 +2243,13 @@ def generate_daily_summary_epub(rows, out_path: str, title_date: str, summary_so
 
 def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str, subject: str, body: str, attachment_path: str, epub_path: str | None = None):
     """
-    通过 SMTP 发送带 PDF 附件的邮件。
+    通过 SMTP 发送带附件的邮件。
 
     注意
     - cfg 来自 conf/config.ini 的 [email] 段
     - to_addr 可为逗号分隔的多个收件人
     - use_ssl=true 使用 SMTP_SSL；否则使用 STARTTLS（仅当服务器支持 starttls）
+    - 默认仅发送 EPUB；如需同时发送 PDF，请在 [email] 配置 attach_pdf=true
     """
     if "email" not in cfg:
         raise RuntimeError("config.ini missing [email] section")
@@ -2301,13 +2266,14 @@ def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str
     retries = int(cfg["email"].get("retries", "2"))          # additional retries; total attempts = 1 + retries
     retry_sleep = float(cfg["email"].get("retry_sleep", "3")) # base seconds, exponential backoff
     warn_mb = float(cfg["email"].get("warn_mb", "2.0"))
+    attach_epub = cfg["email"].get("attach_epub", "true").lower() in ("1", "true", "yes", "y")
+    attach_pdf = cfg["email"].get("attach_pdf", "false").lower() in ("1", "true", "yes", "y")
 
     if not host or not user or not password or not from_addr:
         raise RuntimeError("email config incomplete: need host/user/pass/from")
 
     ap = Path(attachment_path)
-    data = ap.read_bytes()
-    size_mb = len(data) / (1024 * 1024)
+    pdf_bytes: bytes | None = None
 
     # Optional EPUB attachment
     epub_p: Path | None = None
@@ -2322,14 +2288,26 @@ def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str
         except Exception:
             epub_p = None
 
+    attachments: list[tuple[str, bytes, str, str]] = []
+    if attach_epub and epub_p is not None:
+        attachments.append((epub_p.name, epub_p.read_bytes(), "application", "epub+zip"))
+    if attach_pdf:
+        pdf_bytes = ap.read_bytes()
+        attachments.append((ap.name, pdf_bytes, "application", "pdf"))
+
     # Diagnostics
     print(f"[email] smtp={host}:{port} ssl={use_ssl} timeout={timeout_sec}s to={to_addr}")
-    if epub_p is not None:
-        print(f"[email] attach: {ap.name} size={size_mb:.2f}MB + {epub_p.name} size={epub_size_mb:.2f}MB")
+    total_mb = 0.0
+    if attachments:
+        attach_desc = []
+        for filename, payload, _maintype, subtype in attachments:
+            size_mb = len(payload) / (1024 * 1024)
+            total_mb += size_mb
+            attach_desc.append(f"{filename} size={size_mb:.2f}MB type={subtype}")
+        print(f"[email] attach: {' + '.join(attach_desc)}")
     else:
-        print(f"[email] attach: {ap.name} size={size_mb:.2f}MB")
+        print("[email] attach: none (text-only)")
 
-    total_mb = size_mb + (epub_size_mb or 0.0)
     if total_mb >= warn_mb:
         print(
             f"[email][warn] 附件较大（总计 {total_mb:.2f}MB），可能在发送 DATA 阶段超时。"
@@ -2340,24 +2318,18 @@ def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str
     if not recipients:
         raise RuntimeError("email recipients empty after parsing 'to'")
 
-    epub_bytes: bytes | None = None
-    if epub_p is not None:
-        epub_bytes = epub_p.read_bytes()
-
     def _build_message() -> EmailMessage:
         msg = EmailMessage()
         msg["From"] = from_addr
         msg["To"] = ", ".join(recipients)
         msg["Subject"] = subject
         msg.set_content(body)
-        msg.add_attachment(data, maintype="application", subtype="pdf", filename=ap.name)
-        if epub_p is not None and epub_bytes is not None:
-            # Use correct epub+zip mime; many clients rely on this
+        for filename, payload, maintype, subtype in attachments:
             msg.add_attachment(
-                epub_bytes,
-                maintype="application",
-                subtype="epub+zip",
-                filename=epub_p.name,
+                payload,
+                maintype=maintype,
+                subtype=subtype,
+                filename=filename,
             )
         return msg
 
@@ -2413,6 +2385,42 @@ def send_email_with_attachment_smtp(cfg: configparser.ConfigParser, to_addr: str
         f"建议：email.timeout=180~300，或减少日报内容；可设置 email.retries/email.retry_sleep。"
         f"最后错误: {last_err}"
     ) from last_err
+
+
+def build_email_summary_body(rows: list[dict] | None, label: str, *, max_items: int = 10) -> str:
+    rows = list(rows or [])
+    body_lines = [f"{label} 年报摘录汇总已生成。"]
+    if not rows:
+        body_lines.append("")
+        body_lines.append("本次邮件未附带摘要明细数据。")
+        return "\n".join(body_lines)
+
+    company_count = len({str(r.get("stock_code") or "").strip() for r in rows if str(r.get("stock_code") or "").strip()})
+    body_lines.append("")
+    body_lines.append(f"本次纳入公司数：{company_count}")
+
+    ranked = sort_rows_by_score_desc(rows)
+    top_rows = ranked[:max_items]
+    if top_rows:
+        body_lines.append("")
+        body_lines.append(f"得分 Top{min(max_items, len(top_rows))}：")
+        for idx, r in enumerate(top_rows, start=1):
+            score = r.get("score_total")
+            try:
+                score_i = int(score)
+            except Exception:
+                score_i = 0
+            code = str(r.get("stock_code") or "").strip()
+            name = str(r.get("stock_name") or "").strip()
+            year = str(r.get("report_year") or "").strip()
+            publish_date = str(r.get("publish_date") or "").strip()
+            body_lines.append(
+                f"{idx}. {code} {name} | score={score_i} | {year}年 | 公告日 {publish_date}"
+            )
+
+    body_lines.append("")
+    body_lines.append("本邮件由 ReportClaw 自动发送。")
+    return "\n".join(body_lines)
 
 
 def parse_args():
@@ -2478,6 +2486,88 @@ def resolve_score_only(cfg: configparser.ConfigParser, cli_value: bool) -> bool:
         return False
     return cfg.get("report", "score_only", fallback="false").strip().lower() in ("1", "true", "yes", "y")
 
+
+def resolve_slice_enabled(cfg: configparser.ConfigParser) -> bool:
+    if cfg is None:
+        return False
+    return cfg.get("report", "slice_enabled", fallback="false").strip().lower() in ("1", "true", "yes", "y")
+
+
+def resolve_slice_period(cfg: configparser.ConfigParser) -> str:
+    if cfg is None:
+        return "day"
+    v = cfg.get("report", "slice_period", fallback="day").strip().lower()
+    if v in ("day", "week", "month"):
+        return v
+    return "day"
+
+
+def _period_bucket_key(dt_value: dt.datetime, period: str) -> tuple:
+    if period == "month":
+        return (dt_value.year, dt_value.month)
+    if period == "week":
+        iso = dt_value.isocalendar()
+        return (iso.year, iso.week)
+    return (dt_value.year, dt_value.month, dt_value.day)
+
+
+def _period_bucket_label(bucket_key: tuple, period: str) -> str:
+    if period == "month":
+        year, month = bucket_key
+        return f"{year:04d}-{month:02d}"
+    if period == "week":
+        year, week = bucket_key
+        return f"{year:04d}-W{week:02d}"
+    year, month, day = bucket_key
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _range_crosses_period(start_at: dt.datetime, end_at: dt.datetime, period: str) -> bool:
+    return _period_bucket_key(start_at, period) != _period_bucket_key(end_at, period)
+
+
+def _slice_rows_by_period(rows: list[dict], period: str, *, time_field: str) -> list[tuple[str, list[dict]]]:
+    buckets: dict[tuple, list[dict]] = {}
+    for r in rows or []:
+        raw = r.get(time_field)
+        if raw is None:
+            continue
+        if isinstance(raw, dt.datetime):
+            dt_value = raw
+        else:
+            s = str(raw).strip()
+            if not s:
+                continue
+            try:
+                dt_value = dt.datetime.fromisoformat(s[:19].replace(" ", "T"))
+            except Exception:
+                try:
+                    dt_value = dt.datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    try:
+                        dt_value = dt.datetime.strptime(s[:10], "%Y-%m-%d")
+                    except Exception:
+                        continue
+        key = _period_bucket_key(dt_value, period)
+        buckets.setdefault(key, []).append(r)
+
+    ordered: list[tuple[str, list[dict]]] = []
+    for key in sorted(buckets.keys(), reverse=True):
+        ordered.append((_period_bucket_label(key, period), buckets[key]))
+    return ordered
+
+
+def _slice_suffix(period: str, label: str) -> str:
+    prefix = {"day": "D", "week": "W", "month": "M"}.get(period, "D")
+    return f"{prefix}{label}"
+
+
+def _build_slice_output_paths(run_date: dt.date, period: str, label: str) -> tuple[str, str]:
+    stem = f"AR-{run_date.strftime('%m%d')}-{_slice_suffix(period, label)}"
+    pdf = str(DAILY_DIR / f"{stem}.pdf")
+    epub = str(DAILY_DIR / f"{stem}.epub")
+    return pdf, epub
+
 def main():
     """
     CLI 入口：
@@ -2485,20 +2575,27 @@ def main():
     - 增量模式（默认）：按 created_at 生成，成功后更新 last_sent_at
     - 支持 --no-email / --only-email / --today-only
     """
+    overall_started_at = _timer_start()
     args = parse_args()
     cfg = load_config(args.config)
     summary_sort = resolve_summary_sort(cfg, args.summary_sort)
     score_only = resolve_score_only(cfg, args.score_only)
+    slice_enabled = resolve_slice_enabled(cfg)
+    slice_period = resolve_slice_period(cfg)
     now = dt.datetime.now()
+    generated_outputs: list[tuple[str, str | None, str]] = []
+    email_rows: list[dict] | None = None
 
     # Single-stock multi-year mode: ignore date/today-only/incremental window and only generate one company's report.
     if args.stock_code:
         stock_code = str(args.stock_code).strip()
+        fetch_started_at = _timer_start()
         conn = mysql_connect(cfg)
         try:
             rows = fetch_rows_by_stock_code(conn, stock_code)
         finally:
             conn.close()
+        _log_stage_elapsed("single_stock.fetch_rows", fetch_started_at)
 
         if not rows:
             print(f"未找到股票 {stock_code} 的年报记录，不生成汇总文件")
@@ -2514,6 +2611,7 @@ def main():
         out_pdf = str(DAILY_DIR / f"{base_name}.pdf")
         out_epub: str | None = None
 
+        pdf_started_at = _timer_start()
         generate_daily_summary_pdf(
             rows,
             out_pdf,
@@ -2523,10 +2621,12 @@ def main():
             single_stock_mode=True,
         )
         print(f"已生成单公司多年份汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
+        _log_stage_elapsed("single_stock.generate_pdf", pdf_started_at)
 
         epub_enabled = args.epub or cfg.get("epub", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
         if epub_enabled:
             out_epub = str(DAILY_DIR / f"{base_name}.epub")
+            epub_started_at = _timer_start()
             generate_daily_summary_epub(
                 rows,
                 out_epub,
@@ -2536,6 +2636,7 @@ def main():
                 single_stock_mode=True,
             )
             print(f"已生成单公司多年份汇总EPUB: {out_epub} | summary_sort={summary_sort} | score_only={score_only}")
+            _log_stage_elapsed("single_stock.generate_epub", epub_started_at)
 
         enabled = cfg.get("email", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
         if args.email_enabled is not None:
@@ -2557,11 +2658,14 @@ def main():
 
             to_addr = ", ".join(to_list)
             subject = f"单公司多年年报汇总 {title_label}"
-            body = f"附件为 {title_label} 的多年年报打分与摘要汇总。"
+            body = build_email_summary_body(rows, title_label)
+            email_started_at = _timer_start()
             send_email_with_attachment_smtp(cfg, to_addr, subject, body, out_pdf, out_epub)
             print(f"已发送邮件到: {to_addr}")
+            _log_stage_elapsed("single_stock.send_email", email_started_at)
         else:
             print("邮件发送未启用（email.enabled=false 或使用了 --no-email）")
+        _log_stage_elapsed("daily_report.total", overall_started_at)
         return
 
     now = dt.datetime.now()
@@ -2585,6 +2689,7 @@ def main():
             out_pdf = str(_pick_daily_pdf_path(run_date))
 
         if not args.only_email:
+            fetch_started_at = _timer_start()
             conn = mysql_connect(cfg)
             try:
                 rows = fetch_rows_by_publish_date(conn, day)
@@ -2597,28 +2702,38 @@ def main():
                 rows = filter_rows_to_globally_latest_reports(conn, rows)
             finally:
                 conn.close()
+            _log_stage_elapsed("manual.fetch_and_filter_rows", fetch_started_at)
 
             if not rows:
                 print(f"{day} 新增的记录都不是各股票当前最新年报，不生成汇总PDF")
                 return
             rows = sort_rows_by_score_desc(rows)
+            email_rows = list(rows)
+            pdf_started_at = _timer_start()
             generate_daily_summary_pdf(rows, out_pdf, range_label, summary_sort=summary_sort, score_only=score_only)
             print(f"已生成每日汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
+            _log_stage_elapsed("manual.generate_pdf", pdf_started_at)
             epub_enabled = args.epub or cfg.get("epub", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
             if epub_enabled:
                 out_epub = str(_pick_daily_epub_path_for_pdf(out_pdf))
+                epub_started_at = _timer_start()
                 generate_daily_summary_epub(rows, out_epub, range_label, summary_sort=summary_sort,
                                             score_only=score_only)
                 print(f"已生成每日汇总EPUB: {out_epub} | summary_sort={summary_sort} | score_only={score_only}")
+                _log_stage_elapsed("manual.generate_epub", epub_started_at)
+            generated_outputs = [(out_pdf, out_epub, range_label)]
             # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
             try:
+                sheets_started_at = _timer_start()
                 sync_rows_to_google_sheet_with_retry(cfg, rows, run_date=run_date)
+                _log_stage_elapsed("manual.sync_sheets", sheets_started_at)
             except Exception as e:
                 print(f"[sheets] 同步失败（忽略，不影响主流程）：{e}")
         else:
             if not Path(out_pdf).exists():
                 print(f"未找到PDF文件: {out_pdf}，无法仅发送邮件")
                 return
+            generated_outputs = [(out_pdf, out_epub, range_label)]
 
         # 手工模式不更新 last_sent_at（避免影响增量逻辑）
     else:
@@ -2657,6 +2772,7 @@ def main():
             out_pdf = str(_pick_daily_pdf_path(run_date))
 
         if not args.only_email:
+            fetch_started_at = _timer_start()
             conn = mysql_connect(cfg)
             try:
                 rows = fetch_rows_by_created_at_range(conn, start_ts, end_ts)
@@ -2668,25 +2784,61 @@ def main():
 
                 rows = keep_latest_report_per_stock(rows)
                 rows = filter_rows_to_globally_latest_reports(conn, rows)
+                rows = filter_rows_to_publish_year(rows, run_date.year)
             finally:
                 conn.close()
+            _log_stage_elapsed("incremental.fetch_and_filter_rows", fetch_started_at)
 
             if not rows:
-                print(f"{range_label} 新增入库记录都不是各股票当前最新年报，不生成汇总PDF")
+                print(f"{range_label} 新增入库记录中没有“本自然年披露且仍是当前最新”的年报，不生成汇总PDF")
                 return
-            rows = sort_rows_by_score_desc(rows)
-            generate_daily_summary_pdf(rows, out_pdf, range_label, summary_sort=summary_sort, score_only=score_only)
-            print(f"已生成每日汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
-            out_epub: str | None = None
             epub_enabled = args.epub or cfg.get("epub", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
-            if epub_enabled:
-                out_epub = str(_pick_daily_epub_path_for_pdf(out_pdf))
-                generate_daily_summary_epub(rows, out_epub, range_label, summary_sort=summary_sort,
-                                            score_only=score_only)
-                print(f"已生成每日汇总EPUB: {out_epub} | summary_sort={summary_sort} | score_only={score_only}")
+            out_epub: str | None = None
+            if slice_enabled and _range_crosses_period(start_at, end_at, slice_period):
+                slices = _slice_rows_by_period(rows, slice_period, time_field="created_at")
+                print(f"[daily_report] slicing enabled: period={slice_period} slices={len(slices)}")
+                generated_outputs = []
+                for slice_label, slice_rows in slices:
+                    if not slice_rows:
+                        continue
+                    slice_rows = sort_rows_by_score_desc(slice_rows)
+                    email_rows = list(slice_rows)
+                    slice_pdf, slice_epub = _build_slice_output_paths(run_date, slice_period, slice_label)
+                    pdf_started_at = _timer_start()
+                    generate_daily_summary_pdf(slice_rows, slice_pdf, slice_label, summary_sort=summary_sort, score_only=score_only)
+                    print(f"已生成切片PDF: {slice_pdf} | slice={slice_label} | summary_sort={summary_sort} | score_only={score_only}")
+                    _log_stage_elapsed(f"slice.generate_pdf[{slice_label}]", pdf_started_at)
+                    actual_epub: str | None = None
+                    if epub_enabled:
+                        actual_epub = slice_epub
+                        epub_started_at = _timer_start()
+                        generate_daily_summary_epub(slice_rows, actual_epub, slice_label, summary_sort=summary_sort,
+                                                    score_only=score_only)
+                        print(f"已生成切片EPUB: {actual_epub} | slice={slice_label} | summary_sort={summary_sort} | score_only={score_only}")
+                        _log_stage_elapsed(f"slice.generate_epub[{slice_label}]", epub_started_at)
+                    generated_outputs.append((slice_pdf, actual_epub, slice_label))
+                if generated_outputs:
+                    out_pdf, out_epub, range_label = generated_outputs[-1]
+            else:
+                rows = sort_rows_by_score_desc(rows)
+                email_rows = list(rows)
+                pdf_started_at = _timer_start()
+                generate_daily_summary_pdf(rows, out_pdf, range_label, summary_sort=summary_sort, score_only=score_only)
+                print(f"已生成每日汇总PDF: {out_pdf} | summary_sort={summary_sort} | score_only={score_only}")
+                _log_stage_elapsed("incremental.generate_pdf", pdf_started_at)
+                if epub_enabled:
+                    out_epub = str(_pick_daily_epub_path_for_pdf(out_pdf))
+                    epub_started_at = _timer_start()
+                    generate_daily_summary_epub(rows, out_epub, range_label, summary_sort=summary_sort,
+                                                score_only=score_only)
+                    print(f"已生成每日汇总EPUB: {out_epub} | summary_sort={summary_sort} | score_only={score_only}")
+                    _log_stage_elapsed("incremental.generate_epub", epub_started_at)
+                generated_outputs = [(out_pdf, out_epub, range_label)]
             # 同步到 Google Sheets（仅写客观字段，不覆盖 score/tags/notes/status）
             try:
+                sheets_started_at = _timer_start()
                 sync_rows_to_google_sheet_with_retry(cfg, rows, run_date=run_date)
+                _log_stage_elapsed("incremental.sync_sheets", sheets_started_at)
             except Exception as e:
                 print(f"[sheets] 同步失败（忽略，不影响主流程）：{e}")
             # 成功生成日报后推进 last_generated_iso：确保“已经出现在报表里的公司”不会在第二天重复出现
@@ -2696,6 +2848,7 @@ def main():
                 print(f"未找到PDF文件: {out_pdf}，无法仅发送邮件")
                 out_epub = None
                 return
+            generated_outputs = [(out_pdf, out_epub, range_label)]
 
     enabled = cfg.get("email", "enabled", fallback="false").lower() in ("1", "true", "yes", "y")
     if args.email_enabled is not None:
@@ -2718,15 +2871,21 @@ def main():
 
         to_addr = ", ".join(to_list)
 
-        subject = f"年报摘录汇总 {range_label}"
-        body = f"附件为 {range_label} 披露年报的摘录汇总。"
-        send_email_with_attachment_smtp(cfg, to_addr, subject, body, out_pdf, out_epub)
+        email_pdf, email_epub, email_label = generated_outputs[-1] if generated_outputs else (out_pdf, out_epub, range_label)
+        if len(generated_outputs) > 1:
+            print(f"[email][warn] 本次生成了 {len(generated_outputs)} 个切片文件，邮件默认仅发送最后一个切片：{email_label}")
+        subject = f"年报摘录汇总 {email_label}"
+        body = build_email_summary_body(email_rows, email_label)
+        email_started_at = _timer_start()
+        send_email_with_attachment_smtp(cfg, to_addr, subject, body, email_pdf, email_epub)
         print(f"已发送邮件到: {to_addr}")
+        _log_stage_elapsed("daily.send_email", email_started_at)
 
         if not manual_publish_date:
             save_last_sent_at(end_at)
     else:
         print("邮件发送未启用（email.enabled=false 或使用了 --no-email）")
+    _log_stage_elapsed("daily_report.total", overall_started_at)
 
 
 if __name__ == "__main__":

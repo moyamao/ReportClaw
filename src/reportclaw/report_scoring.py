@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -89,6 +90,7 @@ DEFAULT_CAGR_RULE: Dict[str, Any] = {
     "mode": "linear",
     # linear params
     "k": 0.1,          # 20%->2, 50%->5, 100%->10, 200%->20 when k=0.1
+    "score_multiplier": 1.0,  # final score multiplier; e.g. 0.5 means "按同比逻辑的一半分"
     "cap": 30,         # max points per hit
     "min_pct": 20.0,   # ignore pct below this
     # scanning window
@@ -108,6 +110,12 @@ DEFAULT_CAGR_RULE: Dict[str, Any] = {
     "full_negate_if_contains": [],
     # Discount ratio used by negate_if_contains.
     "negate_penalty_ratio": 0.5,
+    # Optional industry-based score discounts for this rule.
+    # Example:
+    # "industry_multipliers": [
+    #   {"industries": ["银行I", "非银金融I"], "multiplier": 0.15}
+    # ]
+    "industry_multipliers": [],
     # thresholds example:
     #   "thresholds": [{"ge": 20, "score": 2}, {"ge": 50, "score": 5}, ...]
 }
@@ -621,7 +629,58 @@ def _is_company_yoy_positive_override(
     return any(mark in compact_ctx for mark in company_markers)
 
 
-def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
+def _resolve_rule_industry_multiplier(
+    rule: Dict[str, Any],
+    report_industries: Iterable[str] | None,
+) -> float:
+    """Resolve an optional score multiplier by report industry.
+
+    Matching is intentionally simple and configuration-friendly:
+    - exact string match against any provided report industry value
+    - substring contains match in either direction
+    """
+    report_vals = [str(x).strip() for x in (report_industries or []) if str(x).strip()]
+    if not report_vals:
+        return 1.0
+
+    items = rule.get("industry_multipliers", [])
+    if not isinstance(items, list):
+        return 1.0
+
+    best = 1.0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            mult = float(item.get("multiplier", 1.0))
+        except Exception:
+            continue
+        if mult <= 0:
+            continue
+
+        inds = item.get("industries", [])
+        if isinstance(inds, str):
+            inds = [inds]
+        if not isinstance(inds, list):
+            continue
+        inds = [str(x).strip() for x in inds if str(x).strip()]
+        if not inds:
+            continue
+
+        matched = False
+        for rv in report_vals:
+            for ind in inds:
+                if rv == ind or ind in rv or rv in ind:
+                    matched = True
+                    break
+            if matched:
+                break
+        if matched:
+            best = min(best, mult)
+    return best
+
+
+def score_cagr_rules(text: str, report_industries: Iterable[str] | None = None) -> Tuple[int, List[Hit]]:
     """Extra scoring rule for CAGR mentions.
 
     Config key: cagr_rule/cagr_rules in scoring_keywords.json
@@ -633,6 +692,7 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
     - Score by:
         mode=linear: score = floor(pct * k), then apply cap/min_pct
         mode=thresholds: pick the largest threshold ge <= pct and use its score
+      then apply score_multiplier
     - Every CAGR hit is preserved and written to DB so downstream analysis can observe
       company / industry trend sentences even when they are neutralized or negated.
     - Context post-processing priority:
@@ -699,6 +759,16 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
         ]
 
         k = float(r.get("k") or 0.1)
+        rule_polarity = str(r.get("polarity") or "pos").strip().lower()
+        if rule_polarity not in ("pos", "neg"):
+            rule_polarity = "pos"
+        try:
+            score_multiplier = float(r.get("score_multiplier", 1.0))
+        except Exception:
+            score_multiplier = 1.0
+        if score_multiplier <= 0:
+            score_multiplier = 1.0
+        score_multiplier *= _resolve_rule_industry_multiplier(r, report_industries)
         cap = int(r.get("cap") or 30)
         min_pct = float(r.get("min_pct") or 0)
 
@@ -779,19 +849,21 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
                     if best_ge is None or best_sc <= 0:
                         continue
                     ge_txt = str(int(best_ge)) if float(best_ge).is_integer() else str(best_ge)
-                    pts = best_sc
-                    base_pts = pts
+                    base_pts = best_sc
+                    abs_pts = max(1, int(math.ceil(abs(base_pts) * score_multiplier)))
+                    pts = -abs_pts if rule_polarity == "neg" else abs_pts
                     label = f">={ge_txt}%"
                 else:
                     # linear
                     if val < min_pct:
                         continue
-                    pts = int(val * k)
-                    if pts <= 0:
+                    base_pts = int(val * k)
+                    if base_pts <= 0:
                         continue
-                    if pts > cap:
-                        pts = cap
-                    base_pts = pts
+                    if base_pts > cap:
+                        base_pts = cap
+                    abs_pts = max(1, int(math.ceil(abs(base_pts) * score_multiplier)))
+                    pts = -abs_pts if rule_polarity == "neg" else abs_pts
                     label = f"={val:g}%"
 
             # Context: prefer the clause containing the *percentage* (more specific than phrase).
@@ -849,7 +921,7 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
             # 1) neutralize  -> 0分
             # 2) negate      -> 折扣负分（默认 0.5）
             # 3) full negate -> 全额负分
-                pol = "pos"
+                pol = "neg" if pts < 0 else "pos"
                 compact_ctx = re.sub(r"\s+", "", ctx or "")
 
                 company_yoy_override = _is_company_yoy_positive_override(
@@ -883,15 +955,10 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
                                 pol = "neg"
                                 break
 
+                # Keep the user-facing keyword label concise in generated reports.
+                # Internal adjustment state (neutral / negated / override) affects points only,
+                # and should not leak into report text as English suffixes.
                 kw_label = f"{active_phrase}{label}"
-                if pts == 0:
-                    kw_label = f"{kw_label}[neutral]"
-                elif pts < 0 and abs(int(pts)) < abs(int(base_pts)):
-                    kw_label = f"{kw_label}[negated]"
-                elif pts < 0 and abs(int(pts)) >= abs(int(base_pts)):
-                    kw_label = f"{kw_label}[full_negated]"
-                elif company_yoy_override:
-                    kw_label = f"{kw_label}[company_override]"
                 norm_ctx = _normalize_cagr_context_for_dedupe(ctx)
                 dedupe_key = (kw_label, norm_ctx)
                 if dedupe_key in seen_exact:
@@ -926,7 +993,11 @@ def score_cagr_rules(text: str) -> Tuple[int, List[Hit]]:
     return total, hits
 
 
-def score_text(text: str, keywords: Dict[str, Dict[str, int]]) -> Tuple[int, List[Hit]]:
+def score_text(
+    text: str,
+    keywords: Dict[str, Dict[str, int]],
+    report_industries: Iterable[str] | None = None,
+) -> Tuple[int, List[Hit]]:
     """Return total score and detailed hits."""
     if not text:
         return 0, []
@@ -935,7 +1006,7 @@ def score_text(text: str, keywords: Dict[str, Dict[str, int]]) -> Tuple[int, Lis
     stop_chars_for_ctx = "。！？!?；;"
 
     # Extra CAGR rule scoring (synthetic hits)
-    cagr_score, cagr_hits = score_cagr_rules(text)
+    cagr_score, cagr_hits = score_cagr_rules(text, report_industries=report_industries)
 
     # Build a single list of (kw, weight, polarity) and sort by kw length desc
     items: List[Tuple[str, int, str]] = []
@@ -1010,6 +1081,7 @@ def fetch_reports_to_score(
     if report_id is not None:
         sql = """
         SELECT r.id AS report_id, r.stock_code, r.stock_name, r.report_year, r.publish_date,
+               r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
                m.chairman_letter, m.industry_section, m.main_business_section, m.future_section, m.full_mda
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
@@ -1020,6 +1092,7 @@ def fetch_reports_to_score(
     if start_time is not None:
         sql = """
         SELECT r.id AS report_id, r.stock_code, r.stock_name, r.report_year, r.publish_date,
+               r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
                m.chairman_letter, m.industry_section, m.main_business_section, m.future_section, m.full_mda
         FROM annual_reports r
         JOIN annual_report_mda m ON m.report_id = r.id
@@ -1035,6 +1108,7 @@ def fetch_reports_to_score(
     since_date = (datetime.now() - timedelta(days=since_days)).date()
     sql = """
     SELECT r.id AS report_id, r.stock_code, r.stock_name, r.report_year, r.publish_date,
+           r.sw_l1_name, r.sw_l2_name, r.sw_l3_name,
            m.chairman_letter, m.industry_section, m.main_business_section, m.future_section, m.full_mda
     FROM annual_reports r
     JOIN annual_report_mda m ON m.report_id = r.id
@@ -1189,7 +1263,12 @@ def main():
         for r in rows:
             rid = int(r["report_id"])
             merged = _merge_report_text(r)
-            total, hits = score_text(merged, keywords)
+            industries = [
+                r.get("sw_l1_name"),
+                r.get("sw_l2_name"),
+                r.get("sw_l3_name"),
+            ]
+            total, hits = score_text(merged, keywords, report_industries=industries)
 
             # Simple console summary
             stock_code = r.get("stock_code")

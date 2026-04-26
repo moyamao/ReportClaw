@@ -8,7 +8,7 @@
   },
   "cagr_rules": [
     {
-      "_comment": "同比增长规则：所有命中都落库。公司本体经营增长优先加分；宏观/行业/第三方统计句子记 neutral；费用成本类按负向处理。",
+      "_comment": "同比增长规则：所有命中都落库。公司本体经营增长优先加分；宏观/行业/第三方统计句子记 neutral；费用成本类按负向处理。银行/非银金融等行业可按行业乘数折减分值。",
       "enabled": true,
       "phrase": "同比增长",
       "phrase_patterns": [
@@ -91,7 +91,86 @@
       "full_negate_if_contains": [
         "财务费用",
         "减值损失"
+      ],
+      "industry_multipliers": [
+        {
+          "industries": [
+            "银行I",
+            "非银金融I",
+            "金融服务I"
+          ],
+          "multiplier": 0.15
+        }
       ]
+    },
+    {
+      "_comment": "同比减少规则：与同比增长规则方向相反，百分比越大扣分越多。",
+      "enabled": true,
+      "phrase": "同比减少",
+      "phrase_patterns": [
+        "(?:较|比)?(?:上年|去年)?同期减少",
+        "(?:较|比)?(?:上年|去年)?同期下降",
+        "(?:较|比)?(?:上年|去年)?同期降低",
+        "同比下降",
+        "同比降低",
+        "同比降幅"
+      ],
+      "mode": "linear",
+      "polarity": "neg",
+      "k": 0.1,
+      "cap": 6,
+      "min_pct": 20,
+      "window_chars": 120,
+      "company_markers": [],
+      "neutralize_if_contains": [
+        "销售费用"
+      ],
+      "negate_if_contains": [],
+      "full_negate_if_contains": []
+    },
+    {
+      "_comment": "销售费用同比减少规则：销售费用下降通常代表费用控制改善，按同比减少百分比正向加分，最高按60%封顶加6分。",
+      "enabled": true,
+      "phrase": "销售费用同比减少",
+      "phrase_patterns": [
+        "销售费用.{0,40}同比减少",
+        "销售费用.{0,40}同比下降",
+        "销售费用.{0,40}同比降低",
+        "销售费用.{0,40}(?:较|比)?(?:上年|去年)?同期减少",
+        "销售费用.{0,40}(?:较|比)?(?:上年|去年)?同期下降",
+        "销售费用.{0,40}(?:较|比)?(?:上年|去年)?同期降低"
+      ],
+      "mode": "linear",
+      "polarity": "pos",
+      "k": 0.1,
+      "cap": 6,
+      "min_pct": 20,
+      "window_chars": 120,
+      "company_markers": [],
+      "neutralize_if_contains": [],
+      "negate_if_contains": [],
+      "full_negate_if_contains": []
+    },
+    {
+      "_comment": "复合增长率规则：当句中出现复合增长率且百分比大于等于15%时，视为行业/赛道未来趋势偏正向；按同比增长逻辑的一半分值计分。该规则当前不做银行/非银金融行业折减。",
+      "enabled": true,
+      "phrase": "复合增长率",
+      "phrase_aliases": [
+        "年复合增长率",
+        "复合年增长率",
+        "年均复合增长率",
+        "CAGR"
+      ],
+      "mode": "linear",
+      "k": 0.1,
+      "score_multiplier": 0.5,
+      "cap": 12,
+      "min_pct": 15,
+      "window_chars": 120,
+      "company_markers": [],
+      "neutralize_if_contains": [],
+      "negate_if_contains": [],
+      "full_negate_if_contains": []
     }
   ]
 }
